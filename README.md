@@ -28,8 +28,13 @@ Time::Seconds
 
 In Linux, 
 install the required webcam 
-software dependency: 
+software dependencies: 
 
-sudo apt-get -y install v4l-utils
+sudo apt-get -y install v4l-utils 
+
+The Perl script named "Webcam-settings.pl" 
+is a separate Perl Tk application that 
+pairs nicely with these Perl scripts 
+because it has a control window with buttons. 
 
 
