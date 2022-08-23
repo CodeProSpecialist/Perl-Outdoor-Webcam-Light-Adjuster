@@ -24,11 +24,11 @@ required perl modules like this:
 
 #install datetime::Event::Sunrise
 
-( continue installing each of 
+( Continue installing each of 
 the Perl modules listed below 
 by installing them one by one 
 with cpan. 
-some of the modules take close to 1 
+Some of the modules take close to 1 
 hour to install, depending on 
 CPU speed and internet connection speed. 
 
