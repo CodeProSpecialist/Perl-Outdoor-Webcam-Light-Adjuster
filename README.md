@@ -13,3 +13,11 @@ DateTime::Duration,
 DateTime::Event::Sunrise, 
 Time::Piece, 
 Time::Seconds 
+
+In Linux, 
+install the required webcam 
+software dependency: 
+
+sudo apt-get -y install v4l-utils
+
+
