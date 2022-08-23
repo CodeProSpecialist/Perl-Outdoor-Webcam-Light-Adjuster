@@ -8,3 +8,8 @@ sunset times.
 First utilize cpan to install the 
 required perl modules: 
 
+DateTime 
+DateTime::Duration 
+DateTime::Event::Sunrise 
+Time::Piece 
+Time::Seconds 
