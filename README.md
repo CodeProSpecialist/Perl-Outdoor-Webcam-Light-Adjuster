@@ -18,7 +18,20 @@ locations of the Perl support files
 from this Perl script application. 
 
 First utilize cpan to install the 
-required perl modules: 
+required perl modules like this: 
+
+#cpan
+
+#install datetime::Event::Sunrise
+
+( continue installing each of 
+the Perl modules listed below 
+by installing them one by one 
+with cpan. 
+some of the modules take close to 1 
+hour to install, depending on 
+CPU speed and internet connection speed. 
+
 
 DateTime, 
 DateTime::Duration, 
