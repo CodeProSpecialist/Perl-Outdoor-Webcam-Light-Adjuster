@@ -55,5 +55,11 @@ in a command line terminal:
 
 perl perl-webcam-day-night-command.pl
 
+In a different command line terminal: 
+perl Webcam-settings.pl
+
+
+
+
 
 
