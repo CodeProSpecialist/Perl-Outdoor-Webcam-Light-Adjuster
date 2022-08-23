@@ -30,7 +30,7 @@ In Linux,
 install the required webcam 
 software dependencies: 
 
-sudo apt-get -y install v4l-utils 
+sudo apt-get -y install v4l-utils perl-tk 
 
 The Perl script named "Webcam-settings.pl" 
 is a separate Perl Tk application that 
