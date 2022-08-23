@@ -50,4 +50,10 @@ is a separate Perl Tk application that
 pairs nicely with these Perl scripts 
 because it has a control window with buttons. 
 
+Run the main command 
+in a command line terminal: 
+
+perl perl-webcam-day-night-command.pl
+
+
 
