@@ -40,7 +40,7 @@ use Time::Seconds;
 
 
 
-# Location for Emporia, KS 
+# Location for Kansas 
 my $lat = "+38.403889"; ## N or S (+)
 my $lon = "-96.181667"; ## E or W (-)
 
