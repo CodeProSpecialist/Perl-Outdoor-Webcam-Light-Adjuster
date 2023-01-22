@@ -40,9 +40,9 @@ use Time::Seconds;
 
 
 
-# Location for USA, Central Time 
-my $lat = "+41.878101"; ## N or S (+)
-my $lon = "-87.629802"; ## E or W (-)
+# Location for Emporia, KS 
+my $lat = "+38.403889"; ## N or S (+)
+my $lon = "-96.181667"; ## E or W (-)
 
 
 # Current date
@@ -285,14 +285,19 @@ if ( $timepiece->hms eq $minutes_before_sunset_A->strftime("%H:%M:%S") ) {
 
 # remember that night = "17:36:00"
 # remember that day = "07:23:00"
-	
-	
+
+
 sleep(1);
 
-print "The Pre-Sunset webcam settings are correctly working right now." , "\n";	
+print "The Pre-Sunset webcam settings are correctly working right now." , "\n";
 
 ##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command 
 do './pre-sunset-sharp-webcam.pl' ;
+
+sleep(1); 
+
+system('perl ~/pre-sunset-sharp-webcam.pl; ');
+
 
 
 };
@@ -307,11 +312,11 @@ if ( $timepiece->hms eq $minutes_after_sunset_B->strftime("%H:%M:%S") ) {
 
 # remember that night = "17:36:00"
 # remember that day = "07:23:00"
-	
+
 
 sleep(1);
-	
-print "The night sharp webcam settings are correctly working right now.\n";	
+
+print "The night sharp webcam settings are correctly working right now.\n";
 
 
 do './day-sharp-webcam.pl'  ;
@@ -320,6 +325,12 @@ sleep(5);
 
 ##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command
 do './night-sharp-webcam.pl'   ;
+
+
+sleep(1);
+
+system('perl ~/night-sharp-webcam.pl; ');
+
 
 
 };
@@ -336,16 +347,18 @@ if ( $timepiece->hms eq $minutes_before_sunrise_A->strftime("%H:%M:%S") ) {
 
 # remember that night = "21:06:00"
 # remember that day = "07:23:00"
-	
-	
+
+
 sleep(1);
 
-print "The Pre-Sunrise webcam settings are correctly working right now.\n";	
+print "The Pre-Sunrise webcam settings are correctly working right now.\n";
 
 ##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command 
 do './pre-sunset-sharp-webcam.pl'  ;
 
+sleep(1);
 
+system('perl ~/pre-sunset-sharp-webcam.pl; ');
 
 };
 
@@ -366,11 +379,11 @@ if ( $timepiece->hms eq $minutes_after_sunrise_B->strftime("%H:%M:%S") ) {
 
 # remember that night = "21:06:00"
 # remember that day = "07:23:00"
-	
+
 
 sleep(1);
-	
-print "The Sunrise, brighter, Daytime webcam settings are correctly working right now.\n";	
+
+print "The Sunrise, brighter, Daytime webcam settings are correctly working right now.\n";
 
 
 ##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command
@@ -382,11 +395,11 @@ sleep(3);
 system('perl ~/day-sharp-webcam.pl; ' ); 
 
 
-# sleep(1);
+sleep(1);
 
 ##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command
 
-# do './day-sharp-webcam.pl'  ;
+do './day-sharp-webcam.pl'  ;
 
 };
 
@@ -404,14 +417,18 @@ if ( $timepiece->hms eq $minutes_after_sunrise_C->strftime("%H:%M:%S") ) {
 # This is the command for the afternoon bright sun 
 # from 14:43 until 16:29 on a January day. 
 
-#     bright-sun-sharp-webcam.pl 	
-	
+#     bright-sun-sharp-webcam.pl 
+
 sleep(1);
 
-print "The Afternoon bright sun webcam settings are correctly working right now.\n";	
+print "The Afternoon bright sun webcam settings are correctly working right now.\n";
 
 ##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command 
 do './bright-sun-sharp-webcam.pl'  ;
+
+sleep(1); 
+
+system('perl ~/bright-sun-sharp-webcam.pl; ' );
 
 
 
@@ -428,17 +445,21 @@ if ( $timepiece->hms eq $minutes_before_sunset_B->strftime("%H:%M:%S") ) {
 
 # remember that night = "21:06:00"
 # remember that day = "07:23:00"
-	
+
 
 sleep(1);
-	
-print "The Daytime webcam settings are correctly working right now.\n";	
+
+print "The Daytime webcam settings are correctly working right now.\n";
 
 
 ##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command
 
 
 system('perl ~/day-sharp-webcam.pl; ' ); 
+
+sleep(1);
+
+do './day-sharp-webcam.pl'  ;
 
 
 # sleep(1);
@@ -461,12 +482,16 @@ if ( $timepiece->hms eq $minutes_after_sunset_C->strftime("%H:%M:%S") ) {
 
 # remember that night = "18:05:00"
 
-	
+
 
 sleep(1);
-	
-print "The night sharp webcam settings are correctly working right now.\n";	
 
+print "The night sharp webcam settings are correctly working right now.\n";
+
+
+system('perl ~/night-sharp-webcam.pl; ' );
+
+sleep(1); 
 
 ##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command
 do './night-sharp-webcam.pl'  ;
@@ -486,7 +511,7 @@ if ( $timepiece->hms eq ("04:45:29") ) {
 
 ## set this for:  if ( $timepiece->hms eq ("04:45:29") ) {
 ## I remember that daylight savings = 2:00am
-	
+
 
 sleep(1);
 
@@ -517,9 +542,9 @@ sleep(1);
 #######
 $timepiece = localtime;
 
-# Location for USA, Central Time 
-my $lat = "+41.878101"; ## N or S (+)
-my $lon = "-87.629802"; ## E or W (-)
+# Location for Emporia, KS 
+my $lat = "+38.403889"; ## N or S (+)
+my $lon = "-96.181667"; ## E or W (-)
 
 # Current date
  $now = DateTime->now;
@@ -615,8 +640,8 @@ my $minutes_before_sunset_B = $math_minutes_before_sunset_B ;
 
 ##### The code above will update the new math time calculations 
 ##### after the sunrise and sunset times are changed. 
-	
-# print "The time update settings are correctly working right now.\n";	
+
+# print "The time update settings are correctly working right now.\n";
 
 
 # clear the text in the terminal screen
