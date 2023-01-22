@@ -41,8 +41,8 @@ use Time::Seconds;
 
 
 # Location for Kansas 
-my $lat = "+38.403889"; ## N or S (+)
-my $lon = "-96.181667"; ## E or W (-)
+my $lat = "+39.403889"; ## N or S (+)
+my $lon = "-94.181667"; ## E or W (-)
 
 
 # Current date
@@ -542,9 +542,9 @@ sleep(1);
 #######
 $timepiece = localtime;
 
-# Location for Emporia, KS 
-my $lat = "+38.403889"; ## N or S (+)
-my $lon = "-96.181667"; ## E or W (-)
+# Location for Kansas 
+my $lat = "+39.403889"; ## N or S (+)
+my $lon = "-94.181667"; ## E or W (-)
 
 # Current date
  $now = DateTime->now;
