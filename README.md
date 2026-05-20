@@ -22,7 +22,7 @@ required perl modules like this:
 
 #cpan
 
-#install datetime::Event::Sunrise
+#install DateTime::Event::Sunrise
 
 ( Continue installing each of 
 the Perl modules listed below 
