@@ -1,76 +1,34 @@
 #!/usr/bin/perl
 use warnings;
 use strict;
-# use Tk;
 
+# Golden evening settings: low warm sun before sunset.
+#
+# The camera settings themselves now live in webcam-preset.pl, which reads the
+# control list from whichever camera is plugged in and picks the matching
+# values. The older webcam and the ONN webcam use different control names and
+# different ranges, so one hard-coded set of numbers cannot serve both.
+#
+# This wrapper is kept so existing habits and the scheduler keep working:
+#   ./pre-sunset-sharp-webcam.pl
+# is the same as
+#   ./webcam-preset.pl golden_pm
 
+my $preset = 'golden_pm';
+my $device = $ENV{WEBCAM_DEVICE} || '/dev/video0';
 
- 
+# Look for the engine next to this script, then in the home directory, then in
+# the current directory, because these scripts get copied to ~ and run both ways.
+my @dirs;
+if ($0 =~ m{^(.*)/[^/]+$}) { push @dirs, $1; }
+push @dirs, ($ENV{HOME} || '.'), '.';
 
-system('v4l2-ctl --set-ctrl sharpness=250 '); 
+for my $d (@dirs) {
+    my $engine = "$d/webcam-preset.pl";
+    next unless -r $engine;
+    my $rc = system($^X, $engine, $preset, $device);
+    exit($rc == 0 ? 0 : 1);
+}
 
-system('v4l2-ctl --set-ctrl  brightness=128 '); 
-
-system('v4l2-ctl --set-ctrl contrast=32 ');
-
-system('v4l2-ctl --set-ctrl saturation=32 ');
-
-system('v4l2-ctl --set-ctrl gain=64 ');
-
-system('v4l2-ctl --set-ctrl exposure_auto=1 ');
-#sleep(4);
-system('v4l2-ctl --set-ctrl exposure_absolute=2047 ');
-
-system('v4l2-ctl --set-ctrl exposure_auto_priority=0 ');
-#sleep(4);
-system('v4l2-ctl --set-ctrl focus_absolute=0 ');
-#sleep(4);
-system('v4l2-ctl --set-ctrl focus_auto=0 ');
-#sleep(4);
-system('v4l2-ctl --set-ctrl  zoom_absolute=1 ');
-
-
-sleep(2);
-
-# BELOW IS DAY SETTINGS 
-system('v4l2-ctl --set-ctrl sharpness=250 '); 
-
-system('v4l2-ctl --set-ctrl  brightness=153 '); 
-
-system('v4l2-ctl --set-ctrl contrast=32 ');
-
-system('v4l2-ctl --set-ctrl saturation=32 ');
-
-system('v4l2-ctl --set-ctrl gain=104 ');
-
-system('v4l2-ctl --set-ctrl exposure_auto=1 ');
-#sleep(4);
-system('v4l2-ctl --set-ctrl exposure_absolute=168 ');
-
-system('v4l2-ctl --set-ctrl exposure_auto_priority=0 ');
-#sleep(4);
-system('v4l2-ctl --set-ctrl focus_absolute=0 ');
-#sleep(4);
-system('v4l2-ctl --set-ctrl focus_auto=0 ');
-#sleep(4);
-system('v4l2-ctl --set-ctrl  zoom_absolute=1 ');
-
-sleep(3);
-
-system('v4l2-ctl --set-ctrl exposure_absolute=100 ');
-
-sleep(3);
-
-system('v4l2-ctl --set-ctrl exposure_absolute=50 ');
-
-sleep(2);
-
-die;
-# system('xterm -hold -e "v4l2-ctl -L " '); 
-   
- 
-
-
-
-
-
+print STDERR "webcam-preset.pl not found next to $0, in \$HOME, or in the current directory.\n";
+exit 1;

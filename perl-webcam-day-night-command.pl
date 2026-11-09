@@ -351,14 +351,14 @@ if ( $timepiece->hms eq $minutes_before_sunrise_A->strftime("%H:%M:%S") ) {
 
 sleep(1);
 
-print "The Pre-Sunrise webcam settings are correctly working right now.\n";
+print "The Golden Morning webcam settings are correctly working right now.\n";
 
-##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command 
-do './pre-sunset-sharp-webcam.pl'  ;
+##### golden morning: low warm sun just after sunrise
+do './post-sunrise-sharp-webcam.pl'  ;
 
 sleep(1);
 
-system('perl ~/pre-sunset-sharp-webcam.pl; ');
+system('perl ~/post-sunrise-sharp-webcam.pl; ');
 
 };
 
@@ -615,9 +615,9 @@ $math_minutes_before_sunrise_A = $sunrise_dt - DateTime::Duration->new( minutes 
  $minutes_after_sunrise_C = $math_minutes_after_sunrise_C ;
 #print "5 Minutes after sunrise " , $minutes_after_sunrise->strftime("%H:%M:%S"),"\n" ;
 
-my $math_minutes_before_sunset_B = $sunset_dt - DateTime::Duration->new( minutes => 39 );
+ $math_minutes_before_sunset_B = $sunset_dt - DateTime::Duration->new( minutes => 39 );
 
-my $minutes_before_sunset_B = $math_minutes_before_sunset_B ;
+ $minutes_before_sunset_B = $math_minutes_before_sunset_B ;
 #print "5 Minutes after sunrise " , $minutes_after_sunrise->strftime("%H:%M:%S"),"\n" ;
 
 
