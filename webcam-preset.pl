@@ -4,7 +4,7 @@ use strict;
 
 # Shared webcam preset engine.
 #
-#   ./webcam-preset.pl night|golden-am|day|bright-sun|golden-pm [/dev/videoN]
+#   ./webcam-preset.pl night|night-mono|golden-am|day|bright-sun|golden-pm [/dev/videoN]
 #
 # Why this exists: these scripts used to hard-code one camera's numbers. The
 # older webcam uses the pre-5.10 kernel control names (exposure_auto,
@@ -27,9 +27,9 @@ my $device = shift(@ARGV) || $ENV{WEBCAM_DEVICE} || '/dev/video0';
 $preset =~ s/-/_/g;
 $preset = lc($preset);
 
-my %VALID = map { $_ => 1 } qw(night golden_am day bright_sun golden_pm);
+my %VALID = map { $_ => 1 } qw(night night_mono golden_am day bright_sun golden_pm);
 unless ($VALID{$preset}) {
-    print STDERR "usage: $0 night|golden-am|day|bright-sun|golden-pm [/dev/videoN]\n";
+    print STDERR "usage: $0 night|night-mono|golden-am|day|bright-sun|golden-pm [/dev/videoN]\n";
     exit 2;
 }
 
@@ -68,18 +68,43 @@ my $wb_auto     = $modern ? 'white_balance_automatic'      : 'white_balance_temp
 # On both APIs the manual setting for auto exposure is 1.
 my $AE_MANUAL = 1;
 
+# Cold white balance on every preset.
+#
+# white_balance_temperature sets the colour temperature the camera ASSUMES the
+# light to be, not the look of the picture. A low value tells the camera the
+# light is warm, so it compensates with blue and the picture comes out cold.
+# 2800 is the coldest-looking setting most webcams accept; anything lower is
+# clamped to the camera's own minimum.
+my $COLD_WB = 2800;
+
 # ---- Value tables ----
 # legacy: the numbers already tuned for the older camera, kept as they were.
 # modern: the numbers tuned for the ONN webcam.
 # Anything the camera does not have is skipped; everything is clamped.
 my %LEGACY = (
+    # Night was retuned to match the ONN settings, mapped onto this camera's
+    # 0-255 ranges rather than copied as raw numbers: brightness and gain to
+    # the top, the longest exposure the driver will take, backlight
+    # compensation on, and sharpness cut back. Heavy sharpening amplifies
+    # sensor noise in the dark, which is why the ONN night preset sits at 3 of
+    # 7 rather than near maximum; 109 of 255 is the same proportion. Set
+    # sharpness back to 250 here if you prefer the old look.
     night => {
-        sharpness => 250, brightness => 193, contrast => 32, saturation => 32,
-        gain => 255, exposure => 1873, aepri => 1, focus => 51, zoom_absolute => 1,
+        sharpness => 109, brightness => 255, contrast => 54, saturation => 64,
+        gain => 255, exposure => 2047, aepri => 1, focus => 51,
+        backlight_compensation => 255, zoom_absolute => 1,
+    },
+    # Colour noise is most of what makes a dark frame look muddy, so this
+    # trades colour for a cleaner, apparently brighter picture.
+    night_mono => {
+        sharpness => 72, brightness => 255, contrast => 67, saturation => 0,
+        gain => 255, exposure => 2047, aepri => 1, focus => 51,
+        backlight_compensation => 255, zoom_absolute => 1,
     },
     golden_am => {
         sharpness => 250, brightness => 170, contrast => 32, saturation => 32,
-        gain => 150, exposure => 200, aepri => 0, focus => 0, zoom_absolute => 1,
+        gain => 150, exposure => 200, aepri => 0, focus => 0,
+        zoom_absolute => 1,
     },
     day => {
         sharpness => 250, brightness => 153, contrast => 32, saturation => 32,
@@ -91,7 +116,8 @@ my %LEGACY = (
     },
     golden_pm => {
         sharpness => 250, brightness => 153, contrast => 32, saturation => 32,
-        gain => 104, exposure => 50, aepri => 0, focus => 0, zoom_absolute => 1,
+        gain => 104, exposure => 50, aepri => 0, focus => 0,
+        zoom_absolute => 1,
     },
 );
 
@@ -101,10 +127,14 @@ my %MODERN = (
         gain => 100, exposure => 5000, aepri => 0, focus => 51,
         backlight_compensation => 12, zoom_absolute => 0,
     },
-    golden_am => {
-        sharpness => 5, brightness => 8, contrast => 28, saturation => 70,
+    night_mono => {
+        sharpness => 2, brightness => 64, contrast => 25, saturation => 0,
+        gain => 100, exposure => 5000, aepri => 0, focus => 51,
+        backlight_compensation => 12, zoom_absolute => 0,
+    },
+    golden_am => {        sharpness => 5, brightness => 8, contrast => 28, saturation => 70,
         gain => 45, exposure => 350, aepri => 0, focus => 50,
-        backlight_compensation => 10, wb_temp => 3400, zoom_absolute => 0,
+        backlight_compensation => 10, zoom_absolute => 0,
     },
     day => {
         sharpness => 5, brightness => 0, contrast => 32, saturation => 64,
@@ -114,12 +144,12 @@ my %MODERN = (
     bright_sun => {
         sharpness => 7, brightness => -30, contrast => 40, saturation => 50,
         gain => 0, exposure => 2, aepri => 0, focus => 50,
-        backlight_compensation => 0, wb_temp => 5500, zoom_absolute => 0,
+        backlight_compensation => 0, zoom_absolute => 0,
     },
     golden_pm => {
         sharpness => 5, brightness => 8, contrast => 28, saturation => 70,
         gain => 35, exposure => 250, aepri => 0, focus => 50,
-        backlight_compensation => 10, wb_temp => 3000, zoom_absolute => 0,
+        backlight_compensation => 10, zoom_absolute => 0,
     },
 );
 
@@ -194,16 +224,18 @@ set_ctrl($focus_auto, 0);
 set_ctrl('focus_absolute', $vals->{focus});
 set_ctrl('zoom_absolute',  $vals->{zoom_absolute});
 
-# White balance: manual and warm during golden hour, automatic otherwise.
-if (defined $vals->{wb_temp}) {
+# Cold white balance on every preset. Automatic is only left on when this
+# camera has no temperature control, because otherwise it would sit in manual
+# at whatever value happened to be set.
+if (exists $ctl{'white_balance_temperature'}) {
     set_ctrl($wb_auto, 0);
-    set_ctrl('white_balance_temperature', $vals->{wb_temp});
+    set_ctrl('white_balance_temperature', $COLD_WB);
 } else {
     set_ctrl($wb_auto, 1);
 }
 
 # Exposure last, once the frame settings are in place.
-if ($preset eq 'night') {
+if ($preset eq 'night' || $preset eq 'night_mono') {
     set_long_exposure($vals->{exposure});
 } else {
     set_ctrl($exp_ctrl, $vals->{exposure});
