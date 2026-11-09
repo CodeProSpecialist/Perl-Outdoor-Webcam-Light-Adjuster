@@ -197,6 +197,10 @@ my $minutes_after_sunset_C = $math_minutes_after_sunset_C ;
 ########
 ########## below is the alarm to run code for night webcam ################
 
+# Which day the 04:46 time refresh last ran on, so that matching the minute
+# rather than one exact second cannot run it twice.
+my $last_refresh_yday = -1;
+
  for (;;) { # I prefer using "for for infinite loops
 
 
@@ -507,11 +511,16 @@ do './night-sharp-webcam.pl'  ;
 # I could also simply look at $time
 
 ##### night code is here #####
-if ( $timepiece->hms eq ("04:45:29") ) {
+if ( $timepiece->strftime("%H:%M") eq "04:46"
+     && $timepiece->yday != $last_refresh_yday ) {
 
-## set this for:  if ( $timepiece->hms eq ("04:45:29") ) {
+## 04:46 is the daily time refresh in all three webcam programs.
+## Matching the minute rather than one exact second, because this loop can
+## skip a second and then the refresh would not run at all that day. The
+## yday guard keeps it to once per day.
 ## I remember that daylight savings = 2:00am
 
+$last_refresh_yday = $timepiece->yday;
 
 sleep(1);
 
