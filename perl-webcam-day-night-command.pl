@@ -67,22 +67,129 @@ latitude => $lat,
 precise => 1
 );
 
+##### Sunrise and sunset: online first, then the shared file #####
+#
+# All three webcam programs now get the times the same way:
+#   1. fetch today's times from api.sunrise-sunset.org (free, no key)
+#   2. if there is no internet, use the newest times saved in the text file
+#   3. if there is no file either, work them out locally with
+#      DateTime::Event::Sunrise, which needs no network
+#
+# Every successful fetch or calculation is written to the shared file, so the
+# ONN settings GUI and the Python program can fall back on it as well.
 
-my $sunrise = $sun->sunrise_datetime($now)->strftime("%H:%M:%S");
+my $sun_file = ($ENV{HOME} || '.') . '/.webcam-sun-times.conf';
+my $sun_tzid = 'America/Chicago';
 
-my $sunset = $sun->sunset_datetime($now)->strftime("%H:%M:%S");
+sub save_sun_file {
+    my ($sunrise_hhmm, $sunset_hhmm, $source) = @_;
+    open(my $fh, '>', $sun_file) or return 0;
+    my $t = localtime;
+    printf $fh "# webcam sunrise/sunset times - written %s\n", $t->strftime("%Y-%m-%d %H:%M");
+    print $fh "sunrise=$sunrise_hhmm\n";
+    print $fh "sunset=$sunset_hhmm\n";
+    print $fh "lat=$lat\n";
+    print $fh "lng=$lon\n";
+    print $fh "source=$source\n";
+    close($fh);
+    return 1;
+}
+
+# Returns (sunrise_hhmm, sunset_hhmm, written_text) or an empty list.
+sub load_sun_file {
+    return () unless -r $sun_file;
+    open(my $fh, '<', $sun_file) or return ();
+    my (%kv, $written);
+    while (my $line = <$fh>) {
+        chomp $line;
+        if ($line =~ /^#.*written\s+(.+)$/) { $written = $1; next; }
+        next if $line =~ /^\s*(#|$)/;
+        my ($k, $v) = split(/=/, $line, 2);
+        next unless defined $k && defined $v;
+        $k =~ s/\s+//g;
+        $v =~ s/^\s+|\s+$//g;
+        $kv{$k} = $v;
+    }
+    close($fh);
+    for my $key (qw(sunrise sunset)) {
+        return () unless defined $kv{$key} && $kv{$key} =~ /^\d{1,2}:\d{2}$/;
+    }
+    return ($kv{sunrise}, $kv{sunset}, $written || 'an unknown date');
+}
+
+# formatted=0 returns ISO timestamps already converted to the given time zone,
+# so the local clock times can be read straight out of the string.
+sub fetch_sun_online {
+    return () unless system("command -v curl >/dev/null 2>&1") == 0;
+    my $url = sprintf(
+        'https://api.sunrise-sunset.org/json?lat=%s&lng=%s&tzid=%s&formatted=0',
+        $lat, $lon, $sun_tzid);
+    my $json = `curl -s --max-time 12 '$url' 2>/dev/null`;
+    return () unless defined $json && length $json;
+    return () unless $json =~ /"status"\s*:\s*"OK"/;
+    my ($srh, $srm) = $json =~ /"sunrise"\s*:\s*"[^"]*?T(\d{2}):(\d{2})/;
+    my ($ssh, $ssm) = $json =~ /"sunset"\s*:\s*"[^"]*?T(\d{2}):(\d{2})/;
+    return () unless defined $srh && defined $ssh;
+    return ("$srh:$srm", "$ssh:$ssm");
+}
+
+# Build today's DateTime for an HH:MM string.
+sub dt_for_hhmm {
+    my ($hhmm) = @_;
+    my ($h, $m) = $hhmm =~ /^(\d{1,2}):(\d{2})$/ or return undef;
+    my $t = localtime;
+    return DateTime->new(
+        year => $t->year, month => $t->mon, day => $t->mday,
+        hour => $h, minute => $m, second => 0,
+        time_zone => $sun_tzid,
+    );
+}
+
+# Today's sunrise and sunset as two DateTime objects, by the order above.
+# Returns an empty list only if all three sources fail.
+sub todays_sun_dts {
+    my ($sr, $ss) = fetch_sun_online();
+    if (defined $sr) {
+        save_sun_file($sr, $ss, 'online');
+        return (dt_for_hhmm($sr), dt_for_hhmm($ss));
+    }
+
+    my @saved = load_sun_file();
+    if (@saved) {
+        print "No internet for the sunrise/sunset lookup; using the times saved $saved[2]\n";
+        return (dt_for_hhmm($saved[0]), dt_for_hhmm($saved[1]));
+    }
+
+    my ($a, $b);
+    if (eval { $a = $sun->sunrise_datetime($now); $b = $sun->sunset_datetime($now); 1 }) {
+        print "No internet and no saved times; worked them out locally instead.\n";
+        save_sun_file($a->strftime("%H:%M"), $b->strftime("%H:%M"), 'calculated');
+        return ($a, $b);
+    }
+    return ();
+}
+
+
+
+my ($sr_src, $ss_src) = todays_sun_dts();
+die "Could not get sunrise and sunset from the internet, the saved file, or a "
+  . "local calculation.\n" unless defined $sr_src && defined $ss_src;
+
+my $sunrise = $sr_src->strftime("%H:%M:%S");
+
+my $sunset = $ss_src->strftime("%H:%M:%S");
 
 ################################ adding time and subtracting time code  ######################################
 ##############################
 ##### calculate for sunrise  #####
  
 my $sunrise_dt = DateTime->new(
-    year       => $sun->sunrise_datetime($now)->strftime("%Y"),
-    month      => $sun->sunrise_datetime($now)->strftime("%m"),
-    day        => $sun->sunrise_datetime($now)->strftime("%d"),
-    hour       => $sun->sunrise_datetime($now)->strftime("%H"),
-    minute     => $sun->sunrise_datetime($now)->strftime("%M"),
-    second     => $sun->sunrise_datetime($now)->strftime("%S"),
+    year       => $sr_src->strftime("%Y"),
+    month      => $sr_src->strftime("%m"),
+    day        => $sr_src->strftime("%d"),
+    hour       => $sr_src->strftime("%H"),
+    minute     => $sr_src->strftime("%M"),
+    second     => $sr_src->strftime("%S"),
     time_zone  => 'America/Chicago',
 );
 
@@ -93,12 +200,12 @@ my $sunrise_dt = DateTime->new(
 ##### calculate for sunset  #####
  
 my $sunset_dt = DateTime->new(
-    year       => $sun->sunset_datetime($now)->strftime("%Y"),
-    month      => $sun->sunset_datetime($now)->strftime("%m"),
-    day        => $sun->sunset_datetime($now)->strftime("%d"),
-    hour       => $sun->sunset_datetime($now)->strftime("%H"),
-    minute     => $sun->sunset_datetime($now)->strftime("%M"),
-    second     => $sun->sunset_datetime($now)->strftime("%S"),
+    year       => $ss_src->strftime("%Y"),
+    month      => $ss_src->strftime("%m"),
+    day        => $ss_src->strftime("%d"),
+    hour       => $ss_src->strftime("%H"),
+    minute     => $ss_src->strftime("%M"),
+    second     => $ss_src->strftime("%S"),
     time_zone  => 'America/Chicago',
 );
 
@@ -533,8 +640,8 @@ $timepiece = localtime ;
 
 $now = localtime ;
 
-$sun = localtime ;
-
+# $sun is deliberately left alone: todays_sun_dts needs it for the local
+# fallback when there is no internet and no saved file.
 $sunrise = localtime ;
 
 $sunset = localtime ;
@@ -570,21 +677,27 @@ precise => 1
 );
 
 
- $sunrise = $sun->sunrise_datetime($now)->strftime("%H:%M:%S");
+# Online first, then the saved file, then a local calculation. If all three
+# fail, yesterday's times stay in use rather than being wiped.
+ my ($sr_new, $ss_new) = todays_sun_dts();
+ if (defined $sr_new && defined $ss_new) {
+ ($sr_src, $ss_src) = ($sr_new, $ss_new);
 
- $sunset = $sun->sunset_datetime($now)->strftime("%H:%M:%S");
+ $sunrise = $sr_src->strftime("%H:%M:%S");
+
+ $sunset = $ss_src->strftime("%H:%M:%S");
 
 ################################ adding time and subtracting time code  ######################################
 ##############################
 ##### calculate for sunrise  #####
  
  $sunrise_dt = DateTime->new(
-    year       => $sun->sunrise_datetime($now)->strftime("%Y"),
-    month      => $sun->sunrise_datetime($now)->strftime("%m"),
-    day        => $sun->sunrise_datetime($now)->strftime("%d"),
-    hour       => $sun->sunrise_datetime($now)->strftime("%H"),
-    minute     => $sun->sunrise_datetime($now)->strftime("%M"),
-    second     => $sun->sunrise_datetime($now)->strftime("%S"),
+    year       => $sr_src->strftime("%Y"),
+    month      => $sr_src->strftime("%m"),
+    day        => $sr_src->strftime("%d"),
+    hour       => $sr_src->strftime("%H"),
+    minute     => $sr_src->strftime("%M"),
+    second     => $sr_src->strftime("%S"),
     time_zone  => 'America/Chicago',
 );
 
@@ -595,12 +708,12 @@ precise => 1
 ##### calculate for sunset  #####
  
  $sunset_dt = DateTime->new(
-    year       => $sun->sunset_datetime($now)->strftime("%Y"),
-    month      => $sun->sunset_datetime($now)->strftime("%m"),
-    day        => $sun->sunset_datetime($now)->strftime("%d"),
-    hour       => $sun->sunset_datetime($now)->strftime("%H"),
-    minute     => $sun->sunset_datetime($now)->strftime("%M"),
-    second     => $sun->sunset_datetime($now)->strftime("%S"),
+    year       => $ss_src->strftime("%Y"),
+    month      => $ss_src->strftime("%m"),
+    day        => $ss_src->strftime("%d"),
+    hour       => $ss_src->strftime("%H"),
+    minute     => $ss_src->strftime("%M"),
+    second     => $ss_src->strftime("%S"),
     time_zone  => 'America/Chicago',
 );
 
@@ -652,6 +765,9 @@ $math_minutes_before_sunrise_A = $sunrise_dt - DateTime::Duration->new( minutes 
 
 # print "The time update settings are correctly working right now.\n";
 
+ } else {
+     print "Could not refresh the times from any source; keeping yesterday's.\n";
+ }
 
 # clear the text in the terminal screen
  system('reset; ');
