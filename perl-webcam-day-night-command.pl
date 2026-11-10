@@ -417,6 +417,61 @@ sub meter_home_dir {
     return '.';
 }
 
+# ---- The error log ----
+#
+# Everything that goes wrong is written here with a timestamp, so a failure at
+# three in the morning can be read back in the morning. The status line in the
+# window only ever shows the latest thing; this keeps the history.
+#
+# What gets logged: the startup probe, every snapshot failure with ffmpeg's own
+# words, every trim the meter applies, every time it re-learns a preset, and
+# anything that stops it working. What does not: the routine pass where the
+# picture is already where it should be, which would be twelve lines a minute
+# and would bury everything worth reading.
+#
+# Repeats are collapsed. A busy camera says so every five seconds, and without
+# this the log would be nothing else; an error identical to the last one is
+# written again only after ten minutes have passed.
+my $LOG_FILE = $ENV{WEBCAM_LOG} || (meter_home_dir() . '/.webcam-light-meter.log');
+my $LOG_MAX  = 1024 * 1024;        # trim the file once it passes a megabyte
+my $log_last_msg = '';
+my $log_last_time = 0;
+
+sub meter_log {
+    my ($msg, %opt) = @_;
+    return unless defined $msg && length $msg;
+
+    # Collapse an identical message repeated inside ten minutes.
+    my $now = time();
+    if (!$opt{always} && $msg eq $log_last_msg && ($now - $log_last_time) < 600) {
+        return;
+    }
+    ($log_last_msg, $log_last_time) = ($msg, $now);
+
+    # Keep the file from growing without end: past a megabyte, the newest 500
+    # lines are kept and the rest dropped.
+    if (-s $LOG_FILE && -s $LOG_FILE > $LOG_MAX) {
+        if (open(my $in, '<', $LOG_FILE)) {
+            my @lines = <$in>;
+            close($in);
+            @lines = @lines[-500 .. -1] if @lines > 500;
+            if (open(my $out, '>', $LOG_FILE)) {
+                print {$out} @lines;
+                close($out);
+            }
+        }
+    }
+
+    open(my $fh, '>>', $LOG_FILE) or return;
+    my @t = localtime($now);
+    printf {$fh} "%04d-%02d-%02d %02d:%02d:%02d  %s\n",
+        $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0], $msg;
+    close($fh);
+    return 1;
+}
+
+sub meter_log_path { return $LOG_FILE; }
+
 # The folder the snapshots live in, under whoever's home directory this is.
 # WEBCAM_SNAPSHOT overrides it. It is created at startup if it is not there,
 # parent folders and all.
@@ -588,6 +643,7 @@ sub meter_learn_ranges {
         $ctrl_range{$name}  = [ @{ $fallback->{$name} } ];
         $ctrl_source{$name} = 'fallback';
     }
+    meter_log(meter_range_report(), always => 1);
     return scalar keys %ctrl_range;
 }
 
@@ -691,6 +747,7 @@ sub capture_snapshot {
         $snap_capture_tried = 1;
         if (system('command -v ffmpeg >/dev/null 2>&1') != 0) {
             $snap_capture_note = 'ffmpeg is not installed, so no snapshots can be taken here';
+            meter_log($snap_capture_note);
             return undef;
         }
     }
@@ -732,9 +789,14 @@ sub capture_snapshot {
             : $why =~ /No such file/i      ? "$dev does not exist - is the camera plugged in?"
             : length $why                  ? "ffmpeg could not take a snapshot: $why"
             :                                "ffmpeg could not take a snapshot from $dev";
+        meter_log("snapshot failed: $snap_capture_note"
+                . (length $why ? " [ffmpeg: $why]" : ''));
         return undef;
     }
-    prune_snapshots($dir);
+    my $gone = prune_snapshots($dir);
+    meter_log("deleted $gone snapshots over the $SNAP_KEEP kept") if $gone;
+    # Worth one line when it starts working again after failing.
+    meter_log("snapshots are being taken again: $name") if length $snap_capture_note;
     $snap_capture_note = '';
     return $name;
 }
@@ -744,10 +806,15 @@ sub capture_snapshot {
 sub meter_prepare_snapshots {
     my $dir = snap_dir();
     return 'light meter: no snapshot folder set' unless defined $dir;
-    return "light meter: cannot create $dir" unless make_dir_path($dir);
+    unless (make_dir_path($dir)) {
+        meter_log("cannot create the snapshot folder $dir");
+        return "light meter: cannot create $dir";
+    }
     my $gone = prune_snapshots($dir);
-    return "light meter: snapshots in $dir, keeping the newest $SNAP_KEEP"
-         . ($gone ? " (deleted $gone older)" : '');
+    my $line = "light meter: snapshots in $dir, keeping the newest $SNAP_KEEP"
+             . ($gone ? " (deleted $gone older)" : '');
+    meter_log($line, always => 1);
+    return $line;
 }
 
 # Find a still to measure. Returns a path, or undef if there is nothing usable.
@@ -980,6 +1047,8 @@ sub meter_pass {
             system("v4l2-ctl -d $dev --set-ctrl sharpness=$sharp 2>/dev/null") if defined $sharp;
             # A preset just changed the light, so refocus for it as well.
             meter_refocus($dev);
+            meter_log('learnt new baseline: '
+                . join(' ', map { "$_=$have{$_}" } sort keys %have), always => 1);
             return 'light meter: learnt the current preset as the baseline'
                  . (defined $sharp ? ", sharpness set to $sharp" : '');
         }
@@ -1000,8 +1069,10 @@ sub meter_pass {
     my $frame = meter_snapshot();
     my ($mean, $hot, $cold) = meter_measure($frame);
     unless (defined $mean) {
-        return 'light meter: ImageMagick is not installed, so the picture cannot be measured'
-            unless length magick_cmd();
+        unless (length magick_cmd()) {
+            meter_log('ImageMagick is not installed, so the picture cannot be measured');
+            return 'light meter: ImageMagick is not installed, so the picture cannot be measured';
+        }
         return 'light meter: no snapshot to measure, the preset stands as it is'
              . (length $snap_capture_note ? " - $snap_capture_note" : '');
     }
@@ -1046,6 +1117,8 @@ sub meter_pass {
             $meter_hold  = $METER_SETTLE;
             @meter_means = ();
             $why .= sprintf(' - trimmed to %+d', $trim);
+            meter_log(sprintf('trim %+d: mean %d of target %d, white %.1f%%, black %.0f%% (%s)',
+                $trim, $m, $mean_target, $hot * 100, $cold * 100, $why), always => 1);
         }
     }
     $meter_dir = $dir;
@@ -1060,6 +1133,7 @@ sub meter_pass {
 meter_learn_ranges($meter_device);
 print meter_range_report(), "\n";
 print meter_prepare_snapshots(), "\n";
+print "light meter: errors are logged to ", meter_log_path(), "\n";
 
  for (;;) { # I prefer using "for for infinite loops
 
