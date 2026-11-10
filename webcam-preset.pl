@@ -85,13 +85,21 @@ my $wb_auto     = $modern ? 'white_balance_automatic'      : 'white_balance_temp
 my $AE_MODE        = 3;
 my $DYN_FRAMERATE  = 1;
 
-# Cold white balance on every preset.
+# Cold white balance on the presets that ask for it.
 #
 # white_balance_temperature sets the colour temperature the camera ASSUMES the
 # light to be, not the look of the picture. A low value tells the camera the
 # light is warm, so it compensates with blue and the picture comes out cold.
 # 2800 is the coldest-looking setting most webcams accept; anything lower is
 # clamped to the camera's own minimum.
+#
+# The rows below carry auto_wb => 1 where automatic white balance is wanted
+# instead: Day and Golden AM, which are the camera's own defaults, and Golden
+# PM, where the light swings from white through orange to dusk inside the hour
+# the preset covers. Pinning that to 2800 was wrong twice over - no single
+# temperature is right for more than a few minutes of it, and telling the
+# camera to expect warm light makes it compensate with blue, cancelling the
+# colour of the evening the preset exists to capture.
 my $COLD_WB = 2800;
 
 # ---- Value tables ----
@@ -131,12 +139,12 @@ my %LEGACY = (
     golden_am => {
         sharpness => 109, brightness => 128, contrast => 86, saturation => 136,
         gain => 0, exposure => 60, aepri => 1, focus => 50,
-        backlight_compensation => 6, zoom_absolute => 0,
+        backlight_compensation => 6, zoom_absolute => 0, auto_wb => 1,
     },
     day => {
         sharpness => 109, brightness => 128, contrast => 86, saturation => 136,
         gain => 0, exposure => 60, aepri => 1, focus => 50,
-        backlight_compensation => 6, zoom_absolute => 0,
+        backlight_compensation => 6, zoom_absolute => 0, auto_wb => 1,
     },
     bright_sun => {
         sharpness => 250, brightness => 153, contrast => 32, saturation => 32,
@@ -146,7 +154,7 @@ my %LEGACY = (
     golden_pm => {
         sharpness => 250, brightness => 153, contrast => 32, saturation => 32,
         gain => 104, exposure => 50, aepri => 0, focus => 0,
-        backlight_compensation => 16, zoom_absolute => 1,
+        backlight_compensation => 16, zoom_absolute => 1, auto_wb => 1,
     },
 );
 
@@ -176,12 +184,12 @@ my %MODERN = (
     golden_am => {
         sharpness => 3, brightness => 0, contrast => 32, saturation => 64,
         gain => 0, exposure => 157, aepri => 1, focus => 50,
-        backlight_compensation => 6, zoom_absolute => 0,
+        backlight_compensation => 6, zoom_absolute => 0, auto_wb => 1,
     },
     day => {
         sharpness => 3, brightness => 0, contrast => 32, saturation => 64,
         gain => 0, exposure => 157, aepri => 1, focus => 50,
-        backlight_compensation => 6, zoom_absolute => 0,
+        backlight_compensation => 6, zoom_absolute => 0, auto_wb => 1,
     },
     bright_sun => {
         sharpness => 7, brightness => -30, contrast => 40, saturation => 50,
@@ -191,7 +199,7 @@ my %MODERN = (
     golden_pm => {
         sharpness => 5, brightness => 8, contrast => 28, saturation => 70,
         gain => 35, exposure => 250, aepri => 0, focus => 50,
-        backlight_compensation => 10, zoom_absolute => 0,
+        backlight_compensation => 10, zoom_absolute => 0, auto_wb => 1,
     },
 );
 
@@ -314,14 +322,16 @@ set_ctrl($focus_auto, 0);
 set_ctrl('focus_absolute', $vals->{focus});
 set_ctrl('zoom_absolute',  $vals->{zoom_absolute});
 
-# Cold white balance on every preset. Automatic is only left on when this
-# camera has no temperature control, because otherwise it would sit in manual
-# at whatever value happened to be set.
-if (exists $ctl{'white_balance_temperature'}) {
+# White balance. Automatic where the preset asks for it, and also when this
+# camera has no temperature control at all, because otherwise it would sit in
+# manual at whatever value happened to be set. Everything else gets the cold
+# setting. Automatic is always sent explicitly rather than left alone, since
+# the previous preset may have switched it off.
+if ($vals->{auto_wb} || !exists $ctl{'white_balance_temperature'}) {
+    set_ctrl($wb_auto, 1);
+} else {
     set_ctrl($wb_auto, 0);
     set_ctrl('white_balance_temperature', $COLD_WB);
-} else {
-    set_ctrl($wb_auto, 1);
 }
 
 # Exposure last, once the frame settings are in place.
