@@ -141,6 +141,34 @@ sub system_timezone {
     return 'UTC';
 }
 
+# The time zone the coordinates sit in, asked of a service that knows the
+# zone map - not guessed from the system clock.
+#
+# This matters because the two are different things. The system zone is
+# whatever this computer was set up with, and a camera reporting to a machine
+# in another state, or a laptop carried across a zone line, would have the sun
+# times worked out for the wrong one. The coordinates are where the camera is,
+# so the zone that belongs to those coordinates is the right answer.
+#
+# Two services again, since free ones come and go. Whatever is found is cached
+# with the location, so this is asked once a week at most.
+sub timezone_for_coords {
+    my ($la, $ln) = @_;
+    return undef unless defined $la && defined $ln;
+    return undef unless system('command -v curl >/dev/null 2>&1') == 0;
+
+    my $url = "https://timeapi.io/api/TimeZone/coordinate?latitude=$la&longitude=$ln";
+    my $json = `curl -s --max-time 6 '$url' 2>/dev/null`;
+    return $1 if defined $json && $json =~ /"timeZone"\s*:\s*"([^"]+)"/;
+
+    $url = "https://api.open-meteo.com/v1/forecast?latitude=$la&longitude=$ln"
+         . "&timezone=auto&forecast_days=1";
+    $json = `curl -s --max-time 6 '$url' 2>/dev/null`;
+    return $1 if defined $json && $json =~ /"timezone"\s*:\s*"([^"]+)"/;
+
+    return undef;
+}
+
 sub save_location {
     my ($la, $ln, $tz, $source) = @_;
     open(my $fh, '>', $LOCATION_FILE) or return 0;
@@ -197,17 +225,32 @@ sub detect_location {
 
     if (defined $ENV{WEBCAM_LAT} && defined $ENV{WEBCAM_LON}
         && length $ENV{WEBCAM_LAT} && length $ENV{WEBCAM_LON}) {
-        my $tz = $ENV{WEBCAM_TZ} || system_timezone();
+        my $tz = $ENV{WEBCAM_TZ}
+              || timezone_for_coords($ENV{WEBCAM_LAT}, $ENV{WEBCAM_LON})
+              || system_timezone();
         return ($ENV{WEBCAM_LAT}, $ENV{WEBCAM_LON}, $tz, 'WEBCAM_LAT and WEBCAM_LON');
     }
 
     my @saved = load_location();
     if (@saved && !$opt{force} && $saved[4] < $LOCATION_MAX_AGE) {
-        return (@saved[0, 1, 2], 'the saved location');
+        my ($la, $ln, $tz) = @saved[0, 1, 2];
+        # A settings file written before the zone was worked out from the
+        # coordinates, or by hand without one, gets it filled in once.
+        if (!defined $tz || !length $tz || $tz eq 'UTC') {
+            my $better = timezone_for_coords($la, $ln);
+            if ($better) {
+                $tz = $better;
+                save_location($la, $ln, $tz, $saved[3]);
+            }
+        }
+        return ($la, $ln, $tz, 'the saved location');
     }
 
-    my ($la, $ln, $tz) = lookup_location_online();
+    my ($la, $ln, $tz_from_ip) = lookup_location_online();
     if (defined $la) {
+        # The zone that belongs to these coordinates, falling back to the one
+        # the IP lookup volunteered and then to the system's own.
+        my $tz = timezone_for_coords($la, $ln) || $tz_from_ip || system_timezone();
         save_location($la, $ln, $tz, 'ip lookup');
         return ($la, $ln, $tz, 'an IP lookup');
     }
@@ -330,6 +373,9 @@ sub todays_sun_dts {
     my ($sr, $ss) = fetch_sun_online();
     if (defined $sr) {
         save_sun_file($sr, $ss, 'online');
+        # The times came back for these coordinates, so the location they were
+        # worked out for is worth keeping as the saved setting.
+        save_location($lat, $lon, $sun_tzid, 'confirmed by the sun-times fetch');
         return (dt_for_hhmm($sr), dt_for_hhmm($ss));
     }
 
