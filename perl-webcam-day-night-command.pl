@@ -455,6 +455,38 @@ my %trim_rule = (
 );
 my @trim_ctrls = sort keys %trim_rule;
 
+# The ranges to use when the camera does not report one.
+#
+# The hardware is asked first, at startup, and whatever it says is what gets
+# used - that is the only way to be right about a camera that has not been
+# seen before. These two tables are the fallback for anything it does not
+# answer for, and they are not invented: they are the ranges these programs
+# have been using all along, the modern set from the ONN webcam's own sliders
+# and the legacy set from the older camera's 0-255 controls.
+#
+# Which table applies is decided by the same test the preset engine uses: a
+# camera with exposure_time_absolute is the modern kind, one with
+# exposure_absolute is the older kind.
+my %FALLBACK_MODERN = (
+    brightness             => [-64,  64],
+    contrast               => [  0,  95],
+    saturation             => [  0, 120],
+    gain                   => [  0, 100],
+    backlight_compensation => [  0,  12],
+    sharpness              => [  0,   7],
+);
+my %FALLBACK_LEGACY = (
+    brightness             => [  0, 255],
+    contrast               => [  0, 255],
+    saturation             => [  0, 255],
+    gain                   => [  0, 255],
+    backlight_compensation => [  0,  16],
+    sharpness              => [  0, 255],
+);
+
+my %ctrl_source;             # control => 'camera' or 'fallback', for reporting
+my $camera_kind = 'unknown';
+
 my $TRIM_MAX = 5;            # steps either side of whatever the preset set
 
 my %ctrl_range;              # name => [min, max], read from the camera
@@ -466,21 +498,64 @@ my @meter_means = ();
 my $meter_dir   = 0;
 my $meter_last  = 0;         # epoch second of the last pass
 
-# Ask the camera for the real range of each control this loop uses. Controls
-# the camera does not have are simply left out, and then never touched.
+# Ask the camera, once at startup, for the real range of every control this
+# loop uses, and fall back to the ranges these programs already used for
+# anything it does not answer for.
+#
+# This matters more than it looks. A trim step is a fraction of a control's
+# range, so a wrong range means a step of the wrong size: guess 0-64 for a
+# contrast control that really runs 0-95 and every correction lands a third
+# short. Asking the hardware is the only way to be right about a camera that
+# has not been seen before, and the fallback means an unanswered control still
+# gets a sensible step instead of being dropped.
 sub meter_learn_ranges {
     my ($dev) = @_;
-    %ctrl_range = ();
+    %ctrl_range  = ();
+    %ctrl_source = ();
+    $camera_kind = 'unknown';
+
     my @lines = `v4l2-ctl -d $dev -L 2>/dev/null`;
+    my %seen;
     for my $line (@lines) {
-        next unless $line =~ /^\s*(\w+)\s+0x[0-9a-f]+\s+\(\w+\)/;
+        next unless $line =~ /^\s*(\w+)\s+0x[0-9a-f]+\s+\((?:int|bool|menu|intmenu)\)/i;
         my $name = $1;
-        next unless exists $trim_rule{$name};
+        $seen{$name} = 1;
+        next unless exists $trim_rule{$name} || $name eq 'sharpness';
         my ($min) = $line =~ /min=(-?\d+)/;
         my ($max) = $line =~ /max=(-?\d+)/;
-        $ctrl_range{$name} = [$min, $max] if defined $min && defined $max && $max > $min;
+        if (defined $min && defined $max && $max > $min) {
+            $ctrl_range{$name}  = [$min, $max];
+            $ctrl_source{$name} = 'camera';
+        }
+    }
+
+    # Same test the preset engine uses to tell the two cameras apart.
+    $camera_kind = 'modern' if $seen{exposure_time_absolute};
+    $camera_kind = 'legacy' if !$seen{exposure_time_absolute} && $seen{exposure_absolute};
+
+    # Anything the camera did not answer for gets the settings already in use.
+    # With no answer at all - camera unplugged, or v4l2-ctl missing - the
+    # modern table is the one to assume, since that is the camera these
+    # programs are run against.
+    my $fallback = ($camera_kind eq 'legacy') ? \%FALLBACK_LEGACY : \%FALLBACK_MODERN;
+    for my $name (@trim_ctrls, 'sharpness') {
+        next if $ctrl_range{$name};
+        next unless $fallback->{$name};
+        $ctrl_range{$name}  = [ @{ $fallback->{$name} } ];
+        $ctrl_source{$name} = 'fallback';
     }
     return scalar keys %ctrl_range;
+}
+
+# One line saying what the startup probe found, for the log or the window.
+sub meter_range_report {
+    my @all = (@trim_ctrls, 'sharpness');
+    my @from_camera = sort grep { ($ctrl_source{$_} || '') eq 'camera'   } @all;
+    my @assumed     = sort grep { ($ctrl_source{$_} || '') eq 'fallback' } @all;
+    my $text = "light meter: $camera_kind camera";
+    $text .= ', ranges read from the camera for ' . join(', ', @from_camera) if @from_camera;
+    $text .= ', using the settings already in use for ' . join(', ', @assumed) if @assumed;
+    return $text;
 }
 
 # Read the controls back in one call. v4l2-ctl takes a comma separated list,
@@ -489,7 +564,11 @@ sub meter_read_ctrls {
     my ($dev) = @_;
     my @names = grep { exists $ctrl_range{$_} } @trim_ctrls;
     return () unless @names;
-    my $out = `v4l2-ctl -d $dev --get-ctrl ` . join(',', @names) . ' 2>/dev/null';
+    # Built as a string first on purpose: backticks are evaluated before any
+    # concatenation around them, so writing the list after a closing backtick
+    # runs v4l2-ctl with no controls named and quietly returns nothing.
+    my $cmd = "v4l2-ctl -d $dev --get-ctrl " . join(',', @names) . ' 2>/dev/null';
+    my $out = `$cmd`;
     my %v;
     while ($out =~ /(\w+):\s*(-?\d+)/g) { $v{$1} = $2 if exists $ctrl_range{$1}; }
     return %v;
@@ -549,6 +628,52 @@ sub meter_measure {
     return ($mean, $hot, 1 - $warm);
 }
 
+# Sharpness, as a fraction of the control's range: full sharpness in daylight
+# and through the golden hours, backed off to 80-90% at night.
+#
+# This is set outright rather than trimmed, and it overrides whatever sharpness
+# the preset asked for - including the night preset's deliberately low value.
+# That is on purpose and on request: the picture is wanted sharp.
+#
+# What decides night from day here is gain, not the clock. Gain is the only
+# control that amplifies the sensor's noise along with the signal, so a camera
+# running near the top of its gain range is by definition working in the dark,
+# whatever time the clock says - and the golden hour presets, which sit under
+# half of the gain range, come out at full sharpness as they should. Sharpening
+# is contrast enhancement at the pixel level and it sharpens noise as happily
+# as it sharpens the edge of a number plate, which is the one reason to ease
+# off at all once the gain is high.
+my $SHARP_DAY   = 1.00;      # at or below half gain: full sharpness
+my $SHARP_NIGHT = 0.90;      # just into high gain
+my $SHARP_DARK  = 0.80;      # at the top of the gain range
+my $SHARP_KNEE  = 0.50;      # the gain fraction where the easing off starts
+
+# Work out the sharpness this amount of gain calls for, in the control's own
+# units. Returns nothing when the camera has no sharpness control or no gain
+# to judge by.
+sub meter_sharpness_for {
+    my ($gain_now) = @_;
+    return undef unless $ctrl_range{sharpness} && $ctrl_range{gain} && defined $gain_now;
+    my ($glo, $ghi) = @{ $ctrl_range{gain} };
+    my ($slo, $shi) = @{ $ctrl_range{sharpness} };
+    my $gain_fraction = ($gain_now - $glo) / ($ghi - $glo);
+    $gain_fraction = 0 if $gain_fraction < 0;
+    $gain_fraction = 1 if $gain_fraction > 1;
+
+    my $want;
+    if ($gain_fraction <= $SHARP_KNEE) {
+        $want = $SHARP_DAY;
+    } else {
+        # Straight line from 90% at the knee down to 80% at full gain.
+        my $into_dark = ($gain_fraction - $SHARP_KNEE) / (1 - $SHARP_KNEE);
+        $want = $SHARP_NIGHT - ($SHARP_NIGHT - $SHARP_DARK) * $into_dark;
+    }
+    my $value = int($slo + ($shi - $slo) * $want + 0.5);
+    $value = $slo if $value < $slo;
+    $value = $shi if $value > $shi;
+    return $value;
+}
+
 # Send the current trim, worked out from the preset's own baseline.
 sub meter_apply_trim {
     my ($dev, $t) = @_;
@@ -567,6 +692,13 @@ sub meter_apply_trim {
         system("v4l2-ctl -d $dev --set-ctrl $ctrl=$v 2>/dev/null");
         $meter_wrote{$ctrl} = $v;
     }
+
+    # Sharpness follows the gain that was just sent. It is deliberately kept
+    # out of %meter_wrote: that hash is how an outside change is spotted, and
+    # sharpness is a value this loop owns outright rather than a trim away
+    # from the preset's own.
+    my $sharp = meter_sharpness_for($meter_wrote{gain});
+    system("v4l2-ctl -d $dev --set-ctrl sharpness=$sharp 2>/dev/null") if defined $sharp;
     return;
 }
 
@@ -583,8 +715,9 @@ sub meter_pass {
     return undef if $now - $meter_last < $METER_EVERY;
     $meter_last = $now;
 
+    # Normally already done at startup; this covers a camera that was not
+    # plugged in then.
     meter_learn_ranges($dev) unless keys %ctrl_range;
-    return 'light meter: camera has none of the controls it adjusts' unless keys %ctrl_range;
 
     # Re-learn the baseline if anything other than this loop moved the
     # controls - a preset firing, or a hand on a slider. This is how the
@@ -612,7 +745,12 @@ sub meter_pass {
             $meter_dir   = 0;
             @meter_means = ();
             $meter_hold  = 1;    # let the new preset show up before correcting
-            return 'light meter: learnt the current preset as the baseline';
+            # The preset just overwrote sharpness with its own value, so put
+            # the wanted sharpness back for the gain this preset runs at.
+            my $sharp = meter_sharpness_for($have{gain});
+            system("v4l2-ctl -d $dev --set-ctrl sharpness=$sharp 2>/dev/null") if defined $sharp;
+            return 'light meter: learnt the current preset as the baseline'
+                 . (defined $sharp ? ", sharpness set to $sharp" : '');
         }
         # Rounding, not an outside change: keep the baseline and the trim, and
         # accept what the driver actually holds as what was written.
@@ -676,6 +814,12 @@ sub meter_pass {
     return sprintf('light meter: trim %+d, mean %d of target %d, white %.1f%%, black %.0f%% - %s',
         $trim, $m, $mean_target, $hot * 100, $cold * 100, $why);
 }
+
+# The startup probe: ask this camera what its controls can actually do before
+# the schedule starts, and say what came back. Anything the camera does not
+# answer for falls back to the ranges these programs already used.
+meter_learn_ranges($meter_device);
+print meter_range_report(), "\n";
 
  for (;;) { # I prefer using "for for infinite loops
 
