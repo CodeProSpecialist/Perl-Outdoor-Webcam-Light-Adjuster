@@ -492,6 +492,12 @@ my %FALLBACK_LEGACY = (
 
 my %ctrl_source;             # control => 'camera' or 'fallback', for reporting
 my $camera_kind = 'unknown';
+my $ctrl_has_focus;          # whichever continuous-autofocus control this camera has
+
+# The two names continuous autofocus goes by: the current one, and the
+# pre-5.10 kernel name on the older webcam.
+my $FOCUS_CTRL        = 'focus_automatic_continuous';
+my $FOCUS_CTRL_LEGACY = 'focus_auto';
 
 my $TRIM_MAX = 5;            # steps either side of whatever the preset set
 
@@ -534,6 +540,11 @@ sub meter_learn_ranges {
             $ctrl_source{$name} = 'camera';
         }
     }
+
+    # Which name this camera's continuous autofocus goes by, if it has one.
+    $ctrl_has_focus = $seen{$FOCUS_CTRL}        ? $FOCUS_CTRL
+                    : $seen{$FOCUS_CTRL_LEGACY} ? $FOCUS_CTRL_LEGACY
+                    :                             undef;
 
     # Same test the preset engine uses to tell the two cameras apart.
     $camera_kind = 'modern' if $seen{exposure_time_absolute};
@@ -806,6 +817,33 @@ sub meter_sharpness_for {
     return $value;
 }
 
+# Re-run the autofocus after a light change.
+#
+# Changing gain, brightness or contrast changes what the autofocus is looking
+# at, and the camera does not always re-run it on its own: the first seconds
+# after a change come out soft, which on a recording is the part you most want
+# sharp. Switching continuous autofocus off and straight back on makes it start
+# a fresh search.
+#
+# It is switched back ON every time, unconditionally, and nothing in these
+# programs ever leaves the camera in manual focus.
+#
+# The pause between off and on is there because the driver has to see the
+# control actually change state; without it the two writes can land in the same
+# instant and nothing is re-triggered. A third of a second is enough, and is
+# not long enough to be felt.
+sub meter_refocus {
+    my ($dev) = @_;
+    # Falls back to the current control name when the probe found nothing, so
+    # autofocus still ends up on; a write to a control the camera lacks fails
+    # harmlessly.
+    my $ctrl = defined $ctrl_has_focus ? $ctrl_has_focus : $FOCUS_CTRL;
+    system("v4l2-ctl -d $dev --set-ctrl $ctrl=0 2>/dev/null");
+    select(undef, undef, undef, 0.33);
+    system("v4l2-ctl -d $dev --set-ctrl $ctrl=1 2>/dev/null");
+    return 1;
+}
+
 # Send the current trim, worked out from the preset's own baseline.
 sub meter_apply_trim {
     my ($dev, $t) = @_;
@@ -831,6 +869,9 @@ sub meter_apply_trim {
     # from the preset's own.
     my $sharp = meter_sharpness_for($meter_wrote{gain});
     system("v4l2-ctl -d $dev --set-ctrl sharpness=$sharp 2>/dev/null") if defined $sharp;
+
+    # The light just moved, so give the autofocus a fresh start on it.
+    meter_refocus($dev);
     return;
 }
 
@@ -881,6 +922,8 @@ sub meter_pass {
             # the wanted sharpness back for the gain this preset runs at.
             my $sharp = meter_sharpness_for($have{gain});
             system("v4l2-ctl -d $dev --set-ctrl sharpness=$sharp 2>/dev/null") if defined $sharp;
+            # A preset just changed the light, so refocus for it as well.
+            meter_refocus($dev);
             return 'light meter: learnt the current preset as the baseline'
                  . (defined $sharp ? ", sharpness set to $sharp" : '');
         }

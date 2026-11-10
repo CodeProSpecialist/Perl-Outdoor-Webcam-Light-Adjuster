@@ -116,14 +116,14 @@ my %LEGACY = (
     # sharpness back to 250 here if you prefer the old look.
     night => {
         sharpness => 109, brightness => 175, contrast => 223, saturation => 64,
-        gain => 255, exposure => 2047, aepri => 1, focus => 51,
+        gain => 255, exposure => 2047, aepri => 1,
         backlight_compensation => 0, zoom_absolute => 1,
     },
     # Colour noise is most of what makes a dark frame look muddy, so this
     # trades colour for a cleaner, apparently brighter picture.
     night_mono => {
         sharpness => 72, brightness => 175, contrast => 223, saturation => 0,
-        gain => 255, exposure => 2047, aepri => 1, focus => 51,
+        gain => 255, exposure => 2047, aepri => 1,
         backlight_compensation => 0, zoom_absolute => 1,
     },
     # backlight_compensation used to be left out of the daylight rows entirely,
@@ -138,22 +138,22 @@ my %LEGACY = (
     # 120 -> 136. Both rows are deliberately identical.
     golden_am => {
         sharpness => 109, brightness => 128, contrast => 86, saturation => 136,
-        gain => 0, exposure => 60, aepri => 1, focus => 50,
+        gain => 0, exposure => 60, aepri => 1,
         backlight_compensation => 6, zoom_absolute => 0, auto_wb => 1,
     },
     day => {
         sharpness => 109, brightness => 128, contrast => 86, saturation => 136,
-        gain => 0, exposure => 60, aepri => 1, focus => 50,
+        gain => 0, exposure => 60, aepri => 1,
         backlight_compensation => 6, zoom_absolute => 0, auto_wb => 1,
     },
     bright_sun => {
         sharpness => 250, brightness => 153, contrast => 32, saturation => 32,
-        gain => 0, exposure => 4, aepri => 0, focus => 0,
+        gain => 0, exposure => 4, aepri => 0,
         backlight_compensation => 0, zoom_absolute => 1,
     },
     golden_pm => {
         sharpness => 250, brightness => 153, contrast => 32, saturation => 32,
-        gain => 104, exposure => 50, aepri => 0, focus => 0,
+        gain => 104, exposure => 50, aepri => 0,
         backlight_compensation => 16, zoom_absolute => 1, auto_wb => 1,
     },
 );
@@ -170,12 +170,12 @@ my %MODERN = (
     # night for the same reason: it lifts shadows, which is more of the fog.
     night => {
         sharpness => 3, brightness => 24, contrast => 56, saturation => 30,
-        gain => 100, exposure => 5000, aepri => 0, focus => 51,
+        gain => 100, exposure => 5000, aepri => 0,
         backlight_compensation => 0, zoom_absolute => 0,
     },
     night_mono => {
         sharpness => 2, brightness => 24, contrast => 56, saturation => 0,
-        gain => 100, exposure => 5000, aepri => 0, focus => 51,
+        gain => 100, exposure => 5000, aepri => 0,
         backlight_compensation => 0, zoom_absolute => 0,
     },
     # Day and Golden AM are the camera's own default light settings, copied
@@ -183,22 +183,22 @@ my %MODERN = (
     # Both rows are deliberately identical.
     golden_am => {
         sharpness => 3, brightness => 0, contrast => 32, saturation => 64,
-        gain => 0, exposure => 157, aepri => 1, focus => 50,
+        gain => 0, exposure => 157, aepri => 1,
         backlight_compensation => 6, zoom_absolute => 0, auto_wb => 1,
     },
     day => {
         sharpness => 3, brightness => 0, contrast => 32, saturation => 64,
-        gain => 0, exposure => 157, aepri => 1, focus => 50,
+        gain => 0, exposure => 157, aepri => 1,
         backlight_compensation => 6, zoom_absolute => 0, auto_wb => 1,
     },
     bright_sun => {
         sharpness => 7, brightness => -30, contrast => 40, saturation => 50,
-        gain => 0, exposure => 2, aepri => 0, focus => 50,
+        gain => 0, exposure => 2, aepri => 0,
         backlight_compensation => 0, zoom_absolute => 0,
     },
     golden_pm => {
         sharpness => 5, brightness => 8, contrast => 28, saturation => 70,
-        gain => 35, exposure => 250, aepri => 0, focus => 50,
+        gain => 35, exposure => 250, aepri => 0,
         backlight_compensation => 10, zoom_absolute => 0, auto_wb => 1,
     },
 );
@@ -318,8 +318,18 @@ set_ctrl('backlight_compensation', $vals->{backlight_compensation})
     if defined $vals->{backlight_compensation};
 
 # Focus is set manually so the camera does not hunt in the dark.
+# Continuous autofocus, always, on every preset. Nothing here ever leaves the
+# camera in manual focus.
+#
+# It is switched off and straight back on rather than simply set to 1, because
+# the light this preset just changed is what the autofocus has to work with:
+# the camera does not always re-run its search on its own, and the first
+# seconds after a preset would otherwise come out soft. The pause is there so
+# the driver sees the control actually change state - without it the two
+# writes can land in the same instant and nothing is re-triggered.
 set_ctrl($focus_auto, 0);
-set_ctrl('focus_absolute', $vals->{focus});
+select(undef, undef, undef, 0.33);
+set_ctrl($focus_auto, 1);
 set_ctrl('zoom_absolute',  $vals->{zoom_absolute});
 
 # White balance. Automatic where the preset asks for it, and also when this
