@@ -76,6 +76,37 @@ process, so a preset's own `exit()` cannot take the scheduler down with it - it
 used to, which meant the scheduler died at the first preset of the day and
 never reached night at all.
 
+## The control window
+
+```
+perl webcam-GUI.pl
+```
+
+A window with the same presets, the same engine and the same automatic light
+adjustment as the scheduler. Both can run at once: neither opens the video
+stream, they only set controls, and each re-reads the other's work rather than
+fighting over it - press a preset here and the light meter notices within five
+seconds and re-learns it as its baseline.
+
+It builds itself from the camera. Every control on the window comes from
+`v4l2-ctl -L` at startup, with the range the camera reported, which is the only
+way one window serves both the older webcam on 0-255 ranges and the current
+ones where brightness runs -64 to 64. Integer and menu controls get a slider
+over the camera's own range, booleans get a checkbox, and a control the camera
+has that this program has never heard of still appears rather than being
+quietly dropped. Nothing is sent that the camera did not confirm it has.
+
+The window scrolls - a camera with every control the kernel defines makes a
+taller column than most screens have room for - with a scrollbar on the right,
+one along the bottom, the wheel, Page Up and Page Down, Home and End.
+
+There is no preview, deliberately: a V4L2 camera lets one program stream at a
+time and the recording software has it. Judge the picture in whatever is
+recording it.
+
+`Webcam-settings.pl`, the older and much simpler button window, is still here
+and still works.
+
 ## The schedule
 
 Presets switch on offsets from today's real sunrise and sunset:
@@ -301,7 +332,8 @@ always did.
 |------|------------|
 | `perl-webcam-day-night-command.pl` | the scheduler, and the light meter loop |
 | `webcam-preset.pl` | the settings engine: reads the camera, applies a preset |
-| `Webcam-settings.pl` | a Tk control window with buttons |
+| `webcam-GUI.pl` | the control window: every camera control, presets, light meter |
+| `Webcam-settings.pl` | the older, simpler button window |
 | `night-sharp-webcam.pl` | wrapper: night |
 | `night-mono-sharp-webcam.pl` | wrapper: night without colour |
 | `post-sunrise-sharp-webcam.pl` | wrapper: golden morning |
