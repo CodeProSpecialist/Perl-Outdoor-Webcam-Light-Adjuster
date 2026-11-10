@@ -118,21 +118,25 @@ my %LEGACY = (
         gain => 255, exposure => 2047, aepri => 1, focus => 51,
         backlight_compensation => 0, zoom_absolute => 1,
     },
-    # These four used to leave backlight_compensation out entirely, which meant
-    # it was never sent and so kept whatever the last preset set. Coming off
-    # night that is 255, which washes out a daylight picture badly, and because
-    # the night preset is the one that runs every evening it was the value that
-    # stuck. The numbers below are the modern table's values scaled onto this
-    # camera's 0-255 range, the same way the rest of this table was derived.
+    # backlight_compensation used to be left out of the daylight rows entirely,
+    # which meant it was never sent and so kept whatever the last preset set.
+    # Coming off night that is 255, which washes out a daylight picture badly,
+    # and because the night preset is the one that runs every evening it was
+    # the value that stuck. It is always sent now.
+    # Day and Golden AM are the camera's own default light settings, taken from
+    # the Defaults preset in the ONN settings GUI and scaled onto this camera's
+    # 0-255 ranges the same way the night row was: sharpness 3 of 7 -> 109,
+    # brightness mid-range -> 128, contrast 32 of 95 -> 86, saturation 64 of
+    # 120 -> 136. Both rows are deliberately identical.
     golden_am => {
-        sharpness => 250, brightness => 170, contrast => 32, saturation => 32,
-        gain => 150, exposure => 200, aepri => 0, focus => 0,
-        backlight_compensation => 16, zoom_absolute => 1,
+        sharpness => 109, brightness => 128, contrast => 86, saturation => 136,
+        gain => 0, exposure => 60, aepri => 1, focus => 50,
+        backlight_compensation => 6, zoom_absolute => 0,
     },
     day => {
-        sharpness => 250, brightness => 153, contrast => 32, saturation => 32,
-        gain => 104, exposure => 4, aepri => 0, focus => 0,
-        backlight_compensation => 6, zoom_absolute => 1,
+        sharpness => 109, brightness => 128, contrast => 86, saturation => 136,
+        gain => 0, exposure => 60, aepri => 1, focus => 50,
+        backlight_compensation => 6, zoom_absolute => 0,
     },
     bright_sun => {
         sharpness => 250, brightness => 153, contrast => 32, saturation => 32,
@@ -166,14 +170,18 @@ my %MODERN = (
         gain => 100, exposure => 5000, aepri => 0, focus => 51,
         backlight_compensation => 0, zoom_absolute => 0,
     },
-    golden_am => {        sharpness => 5, brightness => 8, contrast => 28, saturation => 70,
-        gain => 45, exposure => 350, aepri => 0, focus => 50,
-        backlight_compensation => 10, zoom_absolute => 0,
+    # Day and Golden AM are the camera's own default light settings, copied
+    # from the Defaults preset in the ONN settings GUI rather than tuned.
+    # Both rows are deliberately identical.
+    golden_am => {
+        sharpness => 3, brightness => 0, contrast => 32, saturation => 64,
+        gain => 0, exposure => 157, aepri => 1, focus => 50,
+        backlight_compensation => 6, zoom_absolute => 0,
     },
     day => {
-        sharpness => 5, brightness => 0, contrast => 32, saturation => 64,
-        gain => 20, exposure => 80, aepri => 0, focus => 50,
-        backlight_compensation => 4, zoom_absolute => 0,
+        sharpness => 3, brightness => 0, contrast => 32, saturation => 64,
+        gain => 0, exposure => 157, aepri => 1, focus => 50,
+        backlight_compensation => 6, zoom_absolute => 0,
     },
     bright_sun => {
         sharpness => 7, brightness => -30, contrast => 40, saturation => 50,
