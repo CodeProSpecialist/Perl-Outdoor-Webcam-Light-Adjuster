@@ -436,24 +436,53 @@ sub capture_snapshot {
 
     unless ($snap_capture_tried) {
         $snap_capture_tried = 1;
-        if (system('which ffmpeg >/dev/null 2>&1') != 0) {
+        if (system('command -v ffmpeg >/dev/null 2>&1') != 0) {
             $snap_capture_note = 'ffmpeg is not installed, so no snapshots can be taken here';
             return undef;
         }
     }
-    return undef if length $snap_capture_note;
+    # The note is cleared each attempt, so a camera that was busy a minute ago
+    # is tried again rather than written off for the rest of the session.
+    # ffmpeg missing is the one thing that will not fix itself, so that one
+    # stops here.
+    return undef if $snap_capture_note =~ /not installed/;
+    $snap_capture_note = '';
 
     my @t = localtime();
     my $name = sprintf('%s/snapshot-%04d%02d%02d-%02d%02d%02d.jpg',
         $dir, $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
-    my $rc = system("ffmpeg -nostdin -loglevel quiet -f v4l2 -i $dev"
-                  . " -frames:v 1 -q:v 2 -y '$name' 2>/dev/null");
+    # ffmpeg's own error is kept rather than thrown away. It used to go to
+    # /dev/null and every failure was reported as a busy camera, which is only
+    # one of the things that can go wrong here - the device can be missing, the
+    # user can be outside the video group, the driver can refuse the pixel
+    # format. Guessing at which one wastes an evening; the actual line says.
+    my $err_file = '/tmp/.webcam-meter-ffmpeg.err';
+    my $rc = system("ffmpeg -nostdin -loglevel error -f v4l2 -i $dev"
+                  . " -frames:v 1 -q:v 2 -y '$name' 2>$err_file");
     if ($rc != 0 || !-s $name) {
         unlink $name if -e $name;
-        $snap_capture_note = 'camera is busy, so stills come from the recording software';
+        my $why = '';
+        if (open(my $fh, '<', $err_file)) {
+            my @lines = <$fh>;
+            close($fh);
+            # The last line is the one that says what actually failed.
+            for my $line (reverse @lines) {
+                chomp $line;
+                next unless $line =~ /\S/;
+                $why = $line;
+                last;
+            }
+        }
+        $snap_capture_note =
+              $why =~ /busy/i             ? "camera is busy ($dev is held by something else), so stills come from the recording software"
+            : $why =~ /permission|denied/i ? "no permission to open $dev - add this user to the video group"
+            : $why =~ /No such file/i      ? "$dev does not exist - is the camera plugged in?"
+            : length $why                  ? "ffmpeg could not take a snapshot: $why"
+            :                                "ffmpeg could not take a snapshot from $dev";
         return undef;
     }
     prune_snapshots($dir);
+    $snap_capture_note = '';
     return $name;
 }
 
@@ -771,7 +800,6 @@ sub meter_pass {
     return sprintf('light meter: trim %+d, mean %d of target %d, white %.1f%%, black %.0f%% - %s',
         $trim, $m, $mean_target, $hot * 100, $cold * 100, $why);
 }
-
 
 # ---- The window ----
 
