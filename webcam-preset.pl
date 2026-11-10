@@ -101,23 +101,31 @@ my %LEGACY = (
         gain => 255, exposure => 2047, aepri => 1, focus => 51,
         backlight_compensation => 255, zoom_absolute => 1,
     },
+    # These four used to leave backlight_compensation out entirely, which meant
+    # it was never sent and so kept whatever the last preset set. Coming off
+    # night that is 255, which washes out a daylight picture badly, and because
+    # the night preset is the one that runs every evening it was the value that
+    # stuck. The numbers below are the modern table's values scaled onto this
+    # camera's 0-255 range, the same way the rest of this table was derived.
     golden_am => {
         sharpness => 250, brightness => 170, contrast => 32, saturation => 32,
         gain => 150, exposure => 200, aepri => 0, focus => 0,
-        zoom_absolute => 1,
+        backlight_compensation => 16, zoom_absolute => 1,
     },
     day => {
         sharpness => 250, brightness => 153, contrast => 32, saturation => 32,
-        gain => 104, exposure => 4, aepri => 0, focus => 0, zoom_absolute => 1,
+        gain => 104, exposure => 4, aepri => 0, focus => 0,
+        backlight_compensation => 6, zoom_absolute => 1,
     },
     bright_sun => {
         sharpness => 250, brightness => 153, contrast => 32, saturation => 32,
-        gain => 0, exposure => 4, aepri => 0, focus => 0, zoom_absolute => 1,
+        gain => 0, exposure => 4, aepri => 0, focus => 0,
+        backlight_compensation => 0, zoom_absolute => 1,
     },
     golden_pm => {
         sharpness => 250, brightness => 153, contrast => 32, saturation => 32,
         gain => 104, exposure => 50, aepri => 0, focus => 0,
-        zoom_absolute => 1,
+        backlight_compensation => 16, zoom_absolute => 1,
     },
 );
 
@@ -182,24 +190,70 @@ sub get_ctrl {
     return ($out =~ /:\s*(-?\d+)/) ? $1 : undef;
 }
 
-# Ask for the longest exposure the driver will take. It clamps anything that
-# does not fit in the frame interval, so request, read back, and step down.
+# Does the driver actually keep this exposure, or does it clamp it?
+sub exposure_sticks {
+    my ($try) = @_;
+    system("v4l2-ctl -d $device --set-ctrl $exp_ctrl=$try 2>/dev/null");
+    my $got = get_ctrl($exp_ctrl);
+    return (defined $got && $got >= $try * 0.9) ? $got : undef;
+}
+
+# Ask for the longest exposure the driver will actually take.
+#
+# The kernel documents exposure as limited by the frame interval, and the
+# driver clamps anything longer without saying so, so the only way to find the
+# limit is to ask and read back. This used to try a fixed ladder of fractions
+# of what was wanted - 100%, 80%, 60%, 50%, 40%, 30%, 20%, 10% - and keep the
+# first one that stuck. That gives away a lot of light, because the real limit
+# almost never lands on one of eight fixed steps. Measured against a driver
+# that would accept 626: the ladder settled on 500, a fifth of the available
+# light thrown away. On the legacy camera with a limit of 333 it settled on
+# 204, giving away nearly 40%.
+#
+# So: try what was asked for, and if that is clamped, binary search for the
+# largest value the driver will keep. That costs a handful more calls and
+# finds the limit to within a couple of percent instead of within 20.
 sub set_long_exposure {
     my ($wanted) = @_;
     my $max = exists $ctl{$exp_ctrl} ? $ctl{$exp_ctrl}{max} : $wanted;
+    my $min = exists $ctl{$exp_ctrl} ? $ctl{$exp_ctrl}{min} : 1;
+    $min = 1 if $min < 1;
     $wanted = $max if $wanted > $max;
-    for my $try ($wanted, map { int($wanted * $_ / 10) } (8, 6, 5, 4, 3, 2, 1)) {
-        next if $try < 1;
-        system("v4l2-ctl -d $device --set-ctrl $exp_ctrl=$try 2>/dev/null");
-        my $got = get_ctrl($exp_ctrl);
-        if (defined $got && $got >= $try * 0.9) {
-            printf("  %-30s %s\n", $exp_ctrl, $got);
-            return $got;
-        }
+
+    # The easy case: the driver takes the whole thing.
+    my $got = exposure_sticks($wanted);
+    if (defined $got) {
+        printf("  %-30s %s\n", $exp_ctrl, $got);
+        return $got;
     }
-    my $got = get_ctrl($exp_ctrl);
-    printf("  %-30s %s (driver clamped)\n", $exp_ctrl, defined $got ? $got : '?');
-    return $got;
+
+    # Clamped. $hi is known to fail, $lo is the longest known to work.
+    my ($lo, $hi) = ($min, $wanted);
+    my $best = exposure_sticks($lo);
+    unless (defined $best) {
+        # Even the shortest exposure reads back wrong. Nothing to search.
+        my $cur = get_ctrl($exp_ctrl);
+        printf("  %-30s %s (driver clamped)\n", $exp_ctrl, defined $cur ? $cur : '?');
+        return $cur;
+    }
+
+    # Stop once the remaining gap is under 2%, which is far below anything
+    # visible, rather than burning calls narrowing it to the last unit.
+    my $rounds = 0;
+    while ($hi - $lo > 1 && $hi - $lo > $lo * 0.02 && $rounds++ < 16) {
+        my $mid = int(($lo + $hi) / 2);
+        last if $mid <= $lo || $mid >= $hi;
+        my $ok = exposure_sticks($mid);
+        if (defined $ok) { ($lo, $best) = ($mid, $ok); }
+        else             { $hi = $mid; }
+    }
+
+    # Leave the camera on the best value found, since the search may have
+    # ended on a failed attempt.
+    my $final = exposure_sticks($lo);
+    $best = $final if defined $final;
+    printf("  %-30s %s (driver clamped from %s)\n", $exp_ctrl, $best, $wanted);
+    return $best;
 }
 
 printf("%s preset on %s (%s control names)\n",

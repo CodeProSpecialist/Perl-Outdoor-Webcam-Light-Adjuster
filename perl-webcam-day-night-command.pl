@@ -10,6 +10,48 @@ use DateTime::Duration;
 use DateTime::Event::Sunrise;
 use Time::Piece;
 use Time::Seconds;
+use File::Basename ();
+use Cwd ();
+
+# Run one of the preset wrapper scripts.
+#
+# The presets used to be fired two different ways, one after the other:
+#
+#     do './night-sharp-webcam.pl';
+#     system('perl ~/night-sharp-webcam.pl; ');
+#
+# Both are broken, in different ways.
+#
+# "do FILE" runs the file inside THIS process. Every wrapper script ends in
+# exit(), so the exit took the scheduler down with it. Started from its own
+# directory - the obvious way to start it - this scheduler died the first time
+# a preset fired. At sunset that happens on the day preset a few lines before
+# night, so the camera never reached the night settings at all; the program
+# simply vanished. "do" also silently does nothing when the working directory
+# is not the one holding the scripts, which is the case under cron.
+#
+# The system('perl ~/...') line was there to cover that, but it only works if
+# the scripts have been copied into the home directory, and it ignores the
+# exit status, so a failure looked exactly like a success.
+#
+# This runs the script in a child process, where its exit() ends the child and
+# not the scheduler, finds it wherever it actually lives, uses the same perl
+# this scheduler is running under, and complains when it fails.
+sub run_preset {
+    my ($script) = @_;
+    my @dirs = (File::Basename::dirname(Cwd::abs_path($0)),
+                ($ENV{HOME} || '.'),
+                Cwd::getcwd());
+    for my $dir (@dirs) {
+        my $path = "$dir/$script";
+        next unless -r $path;
+        my $rc = system($^X, $path);
+        warn "$script exited " . ($rc >> 8) . "\n" if $rc != 0;
+        return $rc == 0;
+    }
+    warn "$script not found next to $0, in \$HOME, or in " . Cwd::getcwd() . "\n";
+    return 0;
+}
 
 #use feature qw/say/;
 
@@ -403,14 +445,9 @@ sleep(1);
 print "The Pre-Sunset webcam settings are correctly working right now." , "\n";
 
 ##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command 
-do './pre-sunset-sharp-webcam.pl' ;
+run_preset('pre-sunset-sharp-webcam.pl');
 
 sleep(1); 
-
-system('perl ~/pre-sunset-sharp-webcam.pl; ');
-
-
-
 };
 
 
@@ -430,20 +467,15 @@ sleep(1);
 print "The night sharp webcam settings are correctly working right now.\n";
 
 
-do './day-sharp-webcam.pl'  ;
+run_preset('day-sharp-webcam.pl');
 
 sleep(5);
 
 ##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command
-do './night-sharp-webcam.pl'   ;
+run_preset('night-sharp-webcam.pl');
 
 
 sleep(1);
-
-system('perl ~/night-sharp-webcam.pl; ');
-
-
-
 };
 
 
@@ -465,12 +497,9 @@ sleep(1);
 print "The Golden Morning webcam settings are correctly working right now.\n";
 
 ##### golden morning: low warm sun just after sunrise
-do './post-sunrise-sharp-webcam.pl'  ;
+run_preset('post-sunrise-sharp-webcam.pl');
 
 sleep(1);
-
-system('perl ~/post-sunrise-sharp-webcam.pl; ');
-
 };
 
 
@@ -497,20 +526,16 @@ sleep(1);
 print "The Sunrise, brighter, Daytime webcam settings are correctly working right now.\n";
 
 
-##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command
+# Bounce through night before settling on day. This block always did that, and
+# it is kept deliberately: sending the opposite preset first shakes the camera
+# out of whatever state it has drifted into overnight, so the day settings land
+# on a sensor that has actually been reset rather than being merged into the
+# long night exposure. The same bounce happens the other way round at sunset.
+run_preset('night-sharp-webcam.pl');
 
-system('perl ~/night-sharp-webcam.pl; '); 
+sleep(3);
 
-sleep(3); 
-
-system('perl ~/day-sharp-webcam.pl; ' ); 
-
-
-sleep(1);
-
-##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command
-
-do './day-sharp-webcam.pl'  ;
+run_preset('day-sharp-webcam.pl');
 
 };
 
@@ -535,14 +560,9 @@ sleep(1);
 print "The Afternoon bright sun webcam settings are correctly working right now.\n";
 
 ##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command 
-do './bright-sun-sharp-webcam.pl'  ;
+run_preset('bright-sun-sharp-webcam.pl');
 
 sleep(1); 
-
-system('perl ~/bright-sun-sharp-webcam.pl; ' );
-
-
-
 };
 
 
@@ -564,13 +584,9 @@ print "The Daytime webcam settings are correctly working right now.\n";
 
 
 ##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command
-
-
-system('perl ~/day-sharp-webcam.pl; ' ); 
-
 sleep(1);
 
-do './day-sharp-webcam.pl'  ;
+run_preset('day-sharp-webcam.pl');
 
 
 # sleep(1);
@@ -598,14 +614,10 @@ if ( $timepiece->hms eq $minutes_after_sunset_C->strftime("%H:%M:%S") ) {
 sleep(1);
 
 print "The night sharp webcam settings are correctly working right now.\n";
-
-
-system('perl ~/night-sharp-webcam.pl; ' );
-
 sleep(1); 
 
 ##### do './pre-sunset-sharp-webcam.pl'  ;  ## the correct do command
-do './night-sharp-webcam.pl'  ;
+run_preset('night-sharp-webcam.pl');
 
 
 };
