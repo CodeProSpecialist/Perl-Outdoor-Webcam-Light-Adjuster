@@ -76,6 +76,33 @@ process, so a preset's own `exit()` cannot take the scheduler down with it - it
 used to, which meant the scheduler died at the first preset of the day and
 never reached night at all.
 
+### The clock
+
+Every light change here is worked out from the clock - the sunrise and sunset
+offsets, the 04:46 refresh, which preset belongs to this minute. A computer
+whose clock has drifted applies the night preset in daylight, and nobody
+notices until the recording is useless.
+
+So the real time is fetched at startup and once a day after that, and the
+difference from this machine's clock is carried as an offset. Every decision
+goes through that corrected time.
+
+The source is the `Date` header of an HTTPS response - every web server sends
+one, it needs no API key and cannot be rate limited away - from google.com,
+then cloudflare.com, then timeapi.io as a third try.
+
+**The system clock is not changed.** That needs root, and a camera program has
+no business asking for it: Ubuntu already runs systemd-timesyncd, so if this
+reports a large offset for days on end, `timedatectl status` is the thing to
+look at rather than something for this program to override.
+
+Being offline is not a failure - the fetch simply does not answer, the previous
+offset stays, and everything carries on with the system clock as before. The
+fetch is also how "are we connected" gets answered; a separate check that
+passed while the time server was unreachable would tell us nothing useful.
+The clock status is shown at startup, and an offset of ten seconds or more goes
+to the error log.
+
 ### Where it thinks it is
 
 Sunrise and sunset depend on where you are, and there is no place written down

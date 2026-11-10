@@ -95,6 +95,129 @@ sub home_dir {
     return '.';
 }
 
+# ---- Keeping time ----
+#
+# Everything here is driven by the clock: the sunrise and sunset offsets, the
+# 04:46 refresh, which preset belongs to this minute. A computer whose clock
+# has drifted applies the night preset in daylight and nobody notices until
+# the recording is useless.
+#
+# So the real time is fetched at startup and once a day after that, and the
+# difference between it and this machine's clock is kept as an offset. Every
+# decision in these programs goes through corrected_time() rather than the
+# system clock directly.
+#
+# The system clock itself is NOT changed. That needs root, and a camera
+# program is no business asking for it - Ubuntu already runs
+# systemd-timesyncd, and if this reports a large offset for days on end, that
+# is the thing to look at (`timedatectl status`) rather than something for
+# this program to override.
+#
+# Being offline is not a failure here: the fetch simply does not answer, the
+# previous offset stays, and the programs carry on with the system clock as
+# they always did. The fetch is also how "are we connected" is answered - no
+# separate check, because a check that passes while the time server is
+# unreachable would tell us nothing useful.
+
+use Time::Local ();
+
+my $TIME_REFRESH = 24 * 3600;       # once a day
+my $time_offset  = 0;               # seconds to add to this machine's clock
+my $time_how     = 'not checked yet';
+my $time_last_try = 0;
+
+my %MONTH_NUM = (
+    Jan => 0, Feb => 1, Mar => 2, Apr => 3, May => 4,  Jun => 5,
+    Jul => 6, Aug => 7, Sep => 8, Oct => 9, Nov => 10, Dec => 11,
+);
+
+# "Tue, 10 Nov 2026 17:15:52 GMT" -> epoch seconds.
+sub parse_http_date {
+    my ($text) = @_;
+    return undef unless defined $text;
+    return undef unless $text =~ /(\d{1,2})\s+(\w{3})\s+(\d{4})\s+(\d{2}):(\d{2}):(\d{2})/;
+    my ($day, $mon, $year, $hh, $mm, $ss) = ($1, $2, $3, $4, $5, $6);
+    my $month = $MONTH_NUM{$mon};
+    return undef unless defined $month;
+    my $epoch = eval { Time::Local::timegm($ss, $mm, $hh, $day, $month, $year) };
+    return $epoch;
+}
+
+# What time the internet thinks it is, in epoch seconds, or undef when there
+# is no answer - which is also what being offline looks like.
+#
+# The Date header of any HTTPS response is the first choice: every web server
+# sends one, it needs no API and no key, and it cannot be rate limited away.
+# Two hosts, in case one is unreachable, then a time service as a third.
+sub fetch_network_time {
+    return undef unless system('command -v curl >/dev/null 2>&1') == 0;
+
+    for my $host ('https://www.google.com', 'https://www.cloudflare.com') {
+        my $head = `curl -sS -I -m 6 $host 2>/dev/null`;
+        next unless defined $head && length $head;
+        for my $line (split /\n/, $head) {
+            next unless $line =~ /^date:\s*(.+?)\s*$/i;
+            my $epoch = parse_http_date($1);
+            return $epoch if defined $epoch;
+        }
+    }
+
+    my $json = `curl -sS -m 6 'https://timeapi.io/api/Time/current/zone?timeZone=UTC' 2>/dev/null`;
+    if (defined $json && $json =~ /"year"\s*:\s*(\d+)/) {
+        my $year = $1;
+        my ($mon)  = $json =~ /"month"\s*:\s*(\d+)/;
+        my ($day)  = $json =~ /"day"\s*:\s*(\d+)/;
+        my ($hour) = $json =~ /"hour"\s*:\s*(\d+)/;
+        my ($min)  = $json =~ /"minute"\s*:\s*(\d+)/;
+        my ($sec)  = $json =~ /"seconds"\s*:\s*(\d+)/;
+        if (defined $mon && defined $day && defined $hour && defined $min && defined $sec) {
+            my $epoch = eval {
+                Time::Local::timegm($sec, $min, $hour, $day, $mon - 1, $year);
+            };
+            return $epoch if defined $epoch;
+        }
+    }
+    return undef;
+}
+
+# Fetch the real time and remember how far off this machine is. Returns the
+# offset in seconds, or undef when there was no answer.
+sub sync_network_time {
+    $time_last_try = time();
+    my $real = fetch_network_time();
+    unless (defined $real) {
+        $time_how = 'no answer from a time server - using this machine\'s clock';
+        return undef;
+    }
+
+    my $was = $time_offset;
+    $time_offset = $real - time();
+    $time_how = ($time_offset == 0)
+        ? 'this machine\'s clock agrees with the time server'
+        : sprintf('this machine\'s clock is %d seconds %s, corrected in this program',
+                  abs($time_offset), ($time_offset > 0 ? 'slow' : 'fast'));
+
+    # Worth a line in the log when it matters: a few seconds is nothing, half
+    # a minute will start moving the preset changes about.
+    if (abs($time_offset) >= 10 || abs($time_offset - $was) >= 10) {
+        meter_log("time check: $time_how") if defined &meter_log;
+    }
+    return $time_offset;
+}
+
+# The time everything in these programs should use.
+sub corrected_time { return time() + $time_offset; }
+
+# Re-check once a day. Call it as often as you like; it does nothing until the
+# day is up, so it can live inside a loop that runs every second.
+sub time_check_due {
+    return 0 if ($time_last_try && (time() - $time_last_try) < $TIME_REFRESH);
+    sync_network_time();
+    return 1;
+}
+
+sub time_status { return $time_how; }
+
 # ---- Where this camera is ----
 #
 # The sunrise and sunset times depend on where you are, and nowhere in these
@@ -269,7 +392,7 @@ my $sun_tzid = $detected_tz || system_timezone();
 
 
 # Current date
-my $now = DateTime->now;
+my $now = DateTime->from_epoch(epoch => corrected_time());
 
 $now->set_time_zone($sun_tzid); 
 
@@ -306,7 +429,7 @@ my $sun_file = home_dir() . '/.webcam-sun-times.conf';
 sub save_sun_file {
     my ($sunrise_hhmm, $sunset_hhmm, $source) = @_;
     open(my $fh, '>', $sun_file) or return 0;
-    my $t = localtime;
+    my $t = localtime(corrected_time());
     printf $fh "# webcam sunrise/sunset times - written %s\n", $t->strftime("%Y-%m-%d %H:%M");
     print $fh "sunrise=$sunrise_hhmm\n";
     print $fh "sunset=$sunset_hhmm\n";
@@ -359,7 +482,7 @@ sub fetch_sun_online {
 sub dt_for_hhmm {
     my ($hhmm) = @_;
     my ($h, $m) = $hhmm =~ /^(\d{1,2}):(\d{2})$/ or return undef;
-    my $t = localtime;
+    my $t = localtime(corrected_time());
     return DateTime->new(
         year => $t->year, month => $t->mon, day => $t->mday,
         hour => $h, minute => $m, second => 0,
@@ -1305,11 +1428,16 @@ print meter_range_report(), "\n";
 print meter_prepare_snapshots(), "\n";
 print "light meter: errors are logged to ", meter_log_path(), "\n";
 
+# Every light change below is worked out from the clock, so the clock is
+# checked against a time server now and once a day after that.
+sync_network_time();
+print "clock: ", time_status(), "\n";
+
  for (;;) { # I prefer using "for for infinite loops
 
 
 # localtime creates a Time::Piece object
-my $timepiece = localtime;
+my $timepiece = localtime(corrected_time());
 
 ##### for code debugging and experimenting, I will modify localtime 
 
@@ -1371,6 +1499,9 @@ sleep(1) ;
 # every 5 seconds, and prints only when it has something to say, so the clock
 # display above is not buried.
 {
+    # Once a day; offline it does nothing and the system clock is used.
+    time_check_due();
+
     my $meter_line = meter_pass($meter_device);
     print $meter_line, "\n" if defined $meter_line;
 }
@@ -1631,14 +1762,14 @@ sleep(1);
 
 
 #######
-$timepiece = localtime;
+$timepiece = localtime(corrected_time());
 
 # The detected $lat and $lon from the top of the file are still in scope here.
 # This used to re-declare them with a hard-coded place, which inside the loop
 # meant the detected location was thrown away on the first pass.
 
 # Current date
- $now = DateTime->now;
+ $now = DateTime->from_epoch(epoch => corrected_time());
 
 $now->set_time_zone($sun_tzid);
 
