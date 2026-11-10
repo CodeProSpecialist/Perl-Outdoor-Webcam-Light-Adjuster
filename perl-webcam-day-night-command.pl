@@ -391,11 +391,17 @@ my $meter_device = $ENV{WEBCAM_DEVICE} || '/dev/video0';
 #
 # Needs ImageMagick for the measuring: sudo apt install imagemagick
 
-my $snap_src = $ENV{WEBCAM_SNAPSHOT} || '';
+# The folder the recording software writes its stills into. WEBCAM_SNAPSHOT
+# overrides it; this is the default so that nothing needs setting for the
+# camera these programs were written for.
+my $SNAP_DEFAULT = '/home/x800/Pictures/onn-webcam/program-snapshots-for-auto-adjust-picture';
+
+my $snap_src = $ENV{WEBCAM_SNAPSHOT} || $SNAP_DEFAULT;
 my $snap_tmp = '/tmp/.webcam-meter.jpg';
 
 # Directories worth looking in when nothing is configured.
 my @snap_guess = (
+    $SNAP_DEFAULT,
     ($ENV{HOME} || '.') . '/webcam-snapshots',
     ($ENV{HOME} || '.') . '/.xeoma/snapshots',
     '/opt/Xeoma/snapshots',
@@ -572,6 +578,109 @@ sub meter_read_ctrls {
     my %v;
     while ($out =~ /(\w+):\s*(-?\d+)/g) { $v{$1} = $2 if exists $ctrl_range{$1}; }
     return %v;
+}
+
+# ---- Making the snapshots, and keeping only the last 30 ----
+#
+# The recording software may be writing stills into the folder already, in
+# which case there is nothing to do here. When it is not - an empty folder on
+# the first run - a frame is grabbed here instead, with ffmpeg.
+#
+# That only works while the camera is free. A V4L2 camera lets one program
+# stream at a time, so if the recording software has the device the grab fails
+# with a busy error and there is nothing to be done about it: the loop then
+# measures whatever stills that software writes, which is the arrangement this
+# was built for. The failure is reported once and then left alone, because a
+# warning every five seconds all night is worse than the problem.
+my $SNAP_KEEP = 30;          # snapshots to keep; the oldest beyond this go
+my $snap_capture_note = '';  # set once, so a busy camera is not shouted about
+my $snap_capture_tried = 0;
+
+# mkdir -p, without pulling in File::Path for one line.
+sub make_dir_path {
+    my ($dir) = @_;
+    return 1 if -d $dir;
+    my $sofar = '';
+    for my $part (split m{/}, $dir) {
+        $sofar .= "/$part" if length $part;
+        next unless length $sofar;
+        mkdir $sofar unless -d $sofar;
+    }
+    return -d $dir;
+}
+
+# The snapshot folder, when the source is a folder at all. A single file or an
+# http URL is somebody else's to manage, so neither is written to or pruned.
+sub snap_dir {
+    my $src = length $snap_src ? $snap_src : '';
+    return undef if !length $src || $src =~ m{^https?://} || -f $src;
+    return $src;
+}
+
+# Delete the oldest until only $SNAP_KEEP are left.
+#
+# Everything with a .jpg name in the folder counts, whoever wrote it, because
+# the folder is there for these snapshots and nothing else. Point $snap_src at
+# a folder that holds pictures worth keeping and they will be pruned too.
+sub prune_snapshots {
+    my ($dir) = @_;
+    return unless defined $dir && -d $dir;
+    opendir(my $dh, $dir) or return;
+    my @shots;
+    while (my $f = readdir($dh)) {
+        next unless $f =~ /\.jpe?g$/i;
+        my $path = "$dir/$f";
+        next unless -f $path;
+        push @shots, [ $path, -M $path ];     # -M is age, so smaller is newer
+    }
+    closedir($dh);
+    return if @shots <= $SNAP_KEEP;
+    my @oldest_first = sort { $b->[1] <=> $a->[1] } @shots;
+    my $to_go = @shots - $SNAP_KEEP;
+    unlink $oldest_first[$_][0] for 0 .. ($to_go - 1);
+    return $to_go;
+}
+
+# Grab one frame into the snapshot folder. Returns the path, or undef when the
+# camera is busy, ffmpeg is missing, or there is no folder to write to.
+sub capture_snapshot {
+    my ($dev) = @_;
+    my $dir = snap_dir();
+    return undef unless defined $dir;
+    return undef unless make_dir_path($dir);
+
+    unless ($snap_capture_tried) {
+        $snap_capture_tried = 1;
+        if (system('which ffmpeg >/dev/null 2>&1') != 0) {
+            $snap_capture_note = 'ffmpeg is not installed, so no snapshots can be taken here';
+            return undef;
+        }
+    }
+    return undef if length $snap_capture_note;
+
+    my @t = localtime();
+    my $name = sprintf('%s/snapshot-%04d%02d%02d-%02d%02d%02d.jpg',
+        $dir, $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+    my $rc = system("ffmpeg -nostdin -loglevel quiet -f v4l2 -i $dev"
+                  . " -frames:v 1 -q:v 2 -y '$name' 2>/dev/null");
+    if ($rc != 0 || !-s $name) {
+        unlink $name if -e $name;
+        $snap_capture_note = 'camera is busy, so stills come from the recording software';
+        return undef;
+    }
+    prune_snapshots($dir);
+    return $name;
+}
+
+# Make the snapshot folder if it is not there, and bring it down to size, so
+# the first run starts from a clean folder of at most 30.
+sub meter_prepare_snapshots {
+    my $dir = snap_dir();
+    return 'light meter: no snapshot folder set' unless defined $dir;
+    return "light meter: cannot create $dir" unless make_dir_path($dir);
+    my $gone = prune_snapshots($dir);
+    return "light meter: snapshots in $dir, keeping the newest $SNAP_KEEP"
+         . ($gone ? " (deleted $gone older)" : '');
 }
 
 # Find a still to measure. Returns a path, or undef if there is nothing usable.
@@ -762,10 +871,16 @@ sub meter_pass {
         return sprintf('light meter: trim %+d, waiting for the picture to catch up', $trim);
     }
 
+    # Take one of our own first. When the recording software has the camera
+    # this does nothing and the still it wrote is used instead.
+    capture_snapshot($dev);
+
     my $frame = meter_snapshot();
     my ($mean, $hot, $cold) = meter_measure($frame);
-    return 'light meter: no snapshot to measure, the preset stands as it is'
-        unless defined $mean;
+    unless (defined $mean) {
+        return 'light meter: no snapshot to measure, the preset stands as it is'
+             . (length $snap_capture_note ? " - $snap_capture_note" : '');
+    }
 
     # Median of the last three keeps a passing pair of headlights from
     # dragging the picture darker for the next minute.
@@ -820,6 +935,7 @@ sub meter_pass {
 # answer for falls back to the ranges these programs already used.
 meter_learn_ranges($meter_device);
 print meter_range_report(), "\n";
+print meter_prepare_snapshots(), "\n";
 
  for (;;) { # I prefer using "for for infinite loops
 
