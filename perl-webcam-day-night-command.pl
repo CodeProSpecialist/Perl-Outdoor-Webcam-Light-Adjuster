@@ -350,6 +350,333 @@ my $minutes_after_sunset_C = $math_minutes_after_sunset_C ;
 # rather than one exact second cannot run it twice.
 my $last_refresh_yday = -1;
 
+# The camera these corrections are sent to. The preset wrapper scripts take
+# the same environment variable, so setting WEBCAM_DEVICE once covers both.
+my $meter_device = $ENV{WEBCAM_DEVICE} || '/dev/video0';
+
+# ---- Automatic light adjustment (closed loop on the actual picture) ----
+#
+# This runs 24/7 alongside everything else. It does not replace the presets or
+# the sunrise and sunset schedule: night, day, post-sunrise, pre-sunset, bright
+# sun, cloudy, mono and the defaults all stay exactly as they are, and the
+# clock still decides which of them is in force. What this adds is a
+# correction on top of whichever one is active, so that the picture is neither
+# too bright nor too dark whatever the light outside is actually doing - a
+# cloudy afternoon, a security light coming on at 2am, snow glare at noon.
+#
+# It is a correction and not a replacement because a preset is more than light.
+# The golden hour presets have their warm automatic white balance, bright sun
+# has its cold white balance and tight focus. Something that imposed its own
+# absolute numbers would flatten all of that into one look. So this measures
+# the picture, works out "a bit brighter than this" or "a bit darker than
+# this", and moves five light controls away from whatever the preset set them
+# to, by a trim of -5 to +5 steps. The preset's character survives; only its
+# exposure gets corrected.
+#
+# It re-learns its baseline on its own. Every pass it reads the five controls
+# back off the camera, and if they are not what it last wrote then a preset
+# fired, or a hand moved a slider, so that becomes the new baseline and the
+# trim returns to zero. Nothing has to tell it a preset ran.
+#
+# The picture has to come from the external camera software, because a V4L2
+# camera lets only one program stream from it and that software holds the
+# device. Measuring a still it has already written is not the same as opening
+# the camera. Set $snap_src below, or WEBCAM_SNAPSHOT in the environment, to:
+#   * a directory - the newest .jpg in it is measured, which is what a "save
+#     snapshots to folder" module in the camera software produces
+#   * a single file - for software that overwrites the same still each time
+#   * an http:// URL - a snapshot URL from the camera software's web server
+# With none of those set, nothing is corrected and the presets stand as they
+# are, which is exactly how this program behaved before.
+#
+# Needs ImageMagick for the measuring: sudo apt install imagemagick
+
+my $snap_src = $ENV{WEBCAM_SNAPSHOT} || '';
+my $snap_tmp = '/tmp/.webcam-meter.jpg';
+
+# Directories worth looking in when nothing is configured.
+my @snap_guess = (
+    ($ENV{HOME} || '.') . '/webcam-snapshots',
+    ($ENV{HOME} || '.') . '/.xeoma/snapshots',
+    '/opt/Xeoma/snapshots',
+    '/tmp/webcam-snapshots',
+);
+
+# Measure every 5 seconds, then wait two samples after a correction.
+#
+# Each change takes a moment to reach the next still the camera software
+# writes, and a loop that acts faster than its own feedback arrives will
+# oscillate - the picture breathes in and out all night instead of settling.
+# Ten seconds of patience is what buys the settling.
+my $METER_EVERY  = 5;
+my $METER_SETTLE = 2;
+
+# What a good picture looks like, as numbers.
+#
+# $mean_target is the average grey level wanted out of 255. 100 is a little
+# under middle grey, which suits a dark scene with a few bright lights in it
+# far better than a true middle grey does: aim at 128 and the security light
+# blows out before the car under it is visible.
+#
+# The two clipping limits are the "not too much white light and not too much
+# darkness" check. The mean cannot see either problem on its own - a frame
+# that is half blown-out floodlight and half pitch black averages to a
+# perfectly respectable middle grey while showing nothing at all. So the
+# fraction of the frame gone to pure white and the fraction gone to pure black
+# are measured separately, and either one can override the mean.
+my $mean_target = $ENV{WEBCAM_TARGET} || 100;
+my $MEAN_TOL    = 14;        # dead band, so it is not forever nudging
+my $MAX_HOT     = 0.020;     # at most 2% of the frame blown to white
+my $MAX_COLD    = 0.300;     # at most 30% of the frame crushed to black
+
+# The five controls this loop may touch, and how far each moves per step of
+# trim, as a fraction of that control's own range.
+#
+# A fraction rather than a fixed number because these programs drive more than
+# one camera: brightness is -64 to 64 on one and 0 to 255 on another, so the
+# same raw number would be a nudge on one camera and a lurch on the other. The
+# real range comes from v4l2-ctl -L at startup.
+#
+# Gain carries most of the correction, because it is the control that actually
+# amplifies signal. Brightness moves least: on these webcams it is a black
+# level lift rather than exposure, so it buys apparent brightness at the cost
+# of the black end, which is the mistake the old maximum-brightness night
+# preset made. Contrast rises with the trim to keep the range spread out once
+# gain has lifted everything. Saturation comes DOWN as the trim goes up, which
+# is the "a little bit less colour at night" part - colour is never switched
+# off at any trim, there is just less of it when the gain is high and most of
+# the colour left is noise.
+my %trim_rule = (
+    gain                   =>  0.120,
+    brightness             =>  0.025,
+    contrast               =>  0.030,
+    saturation             => -0.025,
+    backlight_compensation =>  0.200,
+);
+my @trim_ctrls = sort keys %trim_rule;
+
+my $TRIM_MAX = 5;            # steps either side of whatever the preset set
+
+my %ctrl_range;              # name => [min, max], read from the camera
+my %meter_base;              # the preset's own values, re-learnt automatically
+my %meter_wrote;             # what this loop last sent, to spot outside changes
+my $trim        = 0;
+my $meter_hold  = 0;
+my @meter_means = ();
+my $meter_dir   = 0;
+my $meter_last  = 0;         # epoch second of the last pass
+
+# Ask the camera for the real range of each control this loop uses. Controls
+# the camera does not have are simply left out, and then never touched.
+sub meter_learn_ranges {
+    my ($dev) = @_;
+    %ctrl_range = ();
+    my @lines = `v4l2-ctl -d $dev -L 2>/dev/null`;
+    for my $line (@lines) {
+        next unless $line =~ /^\s*(\w+)\s+0x[0-9a-f]+\s+\(\w+\)/;
+        my $name = $1;
+        next unless exists $trim_rule{$name};
+        my ($min) = $line =~ /min=(-?\d+)/;
+        my ($max) = $line =~ /max=(-?\d+)/;
+        $ctrl_range{$name} = [$min, $max] if defined $min && defined $max && $max > $min;
+    }
+    return scalar keys %ctrl_range;
+}
+
+# Read the controls back in one call. v4l2-ctl takes a comma separated list,
+# which is one process instead of five every five seconds.
+sub meter_read_ctrls {
+    my ($dev) = @_;
+    my @names = grep { exists $ctrl_range{$_} } @trim_ctrls;
+    return () unless @names;
+    my $out = `v4l2-ctl -d $dev --get-ctrl ` . join(',', @names) . ' 2>/dev/null';
+    my %v;
+    while ($out =~ /(\w+):\s*(-?\d+)/g) { $v{$1} = $2 if exists $ctrl_range{$1}; }
+    return %v;
+}
+
+# Find a still to measure. Returns a path, or undef if there is nothing usable.
+sub meter_snapshot {
+    my $src = $snap_src;
+    if (!length $src) {
+        for my $d (@snap_guess) { if (-d $d) { $src = $d; last; } }
+    }
+    return undef unless length $src;
+
+    if ($src =~ m{^https?://}) {
+        unlink $snap_tmp;
+        system("curl -s -m 4 -o '$snap_tmp' '$src' 2>/dev/null");
+        return (-s $snap_tmp) ? $snap_tmp : undef;
+    }
+    if (-d $src) {
+        my ($newest, $newest_age) = (undef, 1e18);
+        if (opendir(my $dh, $src)) {
+            while (my $f = readdir($dh)) {
+                next unless $f =~ /\.jpe?g$/i;
+                my $path = "$src/$f";
+                next unless -f $path;
+                my $age = -M $path;
+                if ($age < $newest_age) { ($newest_age, $newest) = ($age, $path); }
+            }
+            closedir($dh);
+        }
+        # A still from last week says nothing about the light right now.
+        return undef if !defined $newest || $newest_age > (10 / 1440);
+        return $newest;
+    }
+    return (-f $src) ? $src : undef;
+}
+
+# Measure a still: average grey level out of 255, and how much of it has gone
+# to pure white and to pure black.
+#
+# The mean is taken on a quarter size copy, which is both faster and steadier -
+# averaging is exactly what shrinking an image does. The clipping figures are
+# taken at full size, where a count of individual blown pixels still means
+# something.
+sub meter_measure {
+    my ($f) = @_;
+    return () unless defined $f;
+    my $mean = `convert "$f" -colorspace Gray -resize 25% -format "%[fx:mean*255]" info: 2>/dev/null`;
+    return () unless defined $mean && $mean =~ /([\d.]+)/;
+    $mean = $1;
+    my $hot  = `convert "$f" -colorspace Gray -threshold 97% -format "%[fx:mean]" info: 2>/dev/null`;
+    my $warm = `convert "$f" -colorspace Gray -threshold 3%  -format "%[fx:mean]" info: 2>/dev/null`;
+    $hot  = ($hot  =~ /([\d.]+)/) ? $1 : 0;
+    $warm = ($warm =~ /([\d.]+)/) ? $1 : 1;
+    # -threshold keeps what is ABOVE the level, so the black fraction is what
+    # is left once the pixels above 3% are taken out.
+    return ($mean, $hot, 1 - $warm);
+}
+
+# Send the current trim, worked out from the preset's own baseline.
+sub meter_apply_trim {
+    my ($dev, $t) = @_;
+    $t = -$TRIM_MAX if $t < -$TRIM_MAX;
+    $t =  $TRIM_MAX if $t >  $TRIM_MAX;
+    $trim = $t;
+    %meter_wrote = ();
+    for my $ctrl (@trim_ctrls) {
+        next unless defined $meter_base{$ctrl} && $ctrl_range{$ctrl};
+        my ($lo, $hi) = @{ $ctrl_range{$ctrl} };
+        my $per = int($trim_rule{$ctrl} * ($hi - $lo) + 0.5 * ($trim_rule{$ctrl} <=> 0));
+        $per = ($trim_rule{$ctrl} > 0 ? 1 : -1) if $per == 0;   # never a no-op step
+        my $v = $meter_base{$ctrl} + ($per * $t);
+        $v = $lo if $v < $lo;
+        $v = $hi if $v > $hi;
+        system("v4l2-ctl -d $dev --set-ctrl $ctrl=$v 2>/dev/null");
+        $meter_wrote{$ctrl} = $v;
+    }
+    return;
+}
+
+sub meter_median {
+    my @s = sort { $a <=> $b } @_;
+    return @s ? $s[int(@s / 2)] : undef;
+}
+
+# One pass. Called as often as you like; it does its work every $METER_EVERY
+# seconds and returns immediately the rest of the time. Returns a status line.
+sub meter_pass {
+    my ($dev) = @_;
+    my $now = time();
+    return undef if $now - $meter_last < $METER_EVERY;
+    $meter_last = $now;
+
+    meter_learn_ranges($dev) unless keys %ctrl_range;
+    return 'light meter: camera has none of the controls it adjusts' unless keys %ctrl_range;
+
+    # Re-learn the baseline if anything other than this loop moved the
+    # controls - a preset firing, or a hand on a slider. This is how the
+    # correction stays a correction to whatever is in force rather than
+    # drifting off on its own.
+    #
+    # Two units of slack, because a driver may round a control to its own step
+    # size. Without the slack a value that comes back as 99 after 100 was sent
+    # would look like an outside change, the baseline would be re-learnt with
+    # the trim already inside it, and the next correction would trim again from
+    # there: a ratchet that walks the picture off in one direction.
+    my %have = meter_read_ctrls($dev);
+    if (keys %have) {
+        my $outside = 0;
+        for my $ctrl (keys %have) {
+            if (!defined $meter_wrote{$ctrl} || abs($meter_wrote{$ctrl} - $have{$ctrl}) > 2) {
+                $outside = 1;
+                last;
+            }
+        }
+        if ($outside) {
+            %meter_base  = %have;
+            %meter_wrote = %have;
+            $trim        = 0;
+            $meter_dir   = 0;
+            @meter_means = ();
+            $meter_hold  = 1;    # let the new preset show up before correcting
+            return 'light meter: learnt the current preset as the baseline';
+        }
+        # Rounding, not an outside change: keep the baseline and the trim, and
+        # accept what the driver actually holds as what was written.
+        $meter_wrote{$_} = $have{$_} for keys %have;
+    }
+
+    if ($meter_hold > 0) {
+        $meter_hold--;
+        return sprintf('light meter: trim %+d, waiting for the picture to catch up', $trim);
+    }
+
+    my $frame = meter_snapshot();
+    my ($mean, $hot, $cold) = meter_measure($frame);
+    return 'light meter: no snapshot to measure, the preset stands as it is'
+        unless defined $mean;
+
+    # Median of the last three keeps a passing pair of headlights from
+    # dragging the picture darker for the next minute.
+    push @meter_means, $mean;
+    shift @meter_means while @meter_means > 3;
+    my $m = meter_median(@meter_means);
+
+    # Which way to go. The clipping checks come first: they are the too much
+    # white light and too much darkness tests, and either can override a mean
+    # that looks perfectly reasonable on its own.
+    my $dir = 0;
+    my $why = 'picture is where it should be';
+    if ($hot > $MAX_HOT && $m > $mean_target - $MEAN_TOL) {
+        $dir = -1; $why = sprintf('%.1f%% of the frame blown to white', $hot * 100);
+    } elsif ($cold > $MAX_COLD && $m < $mean_target + $MEAN_TOL) {
+        $dir =  1; $why = sprintf('%.0f%% of the frame crushed to black', $cold * 100);
+    } elsif ($m > $mean_target + $MEAN_TOL) {
+        $dir = -1; $why = 'too bright';
+    } elsif ($m < $mean_target - $MEAN_TOL) {
+        $dir =  1; $why = 'too dark';
+    }
+
+    # A security light over black tarmac holds more range than the sensor can
+    # take, and then both checks fail at once: brightening blows the light
+    # further, darkening loses the car. Rather than run off to one end of the
+    # trim chasing an impossible picture, it stops and says so.
+    if ($dir > 0 && $hot > $MAX_HOT * 3) {
+        $dir = 0; $why = 'high contrast scene - cannot lift the dark without blowing the light';
+    } elsif ($dir < 0 && $cold > $MAX_COLD * 2) {
+        $dir = 0; $why = 'high contrast scene - cannot tame the light without losing the dark';
+    }
+
+    # Two samples in a row have to agree before anything moves.
+    if ($dir != 0 && $dir == $meter_dir) {
+        if (($dir > 0 && $trim >= $TRIM_MAX) || ($dir < 0 && $trim <= -$TRIM_MAX)) {
+            $why .= ' - trim at its limit, the preset itself needs changing';
+        } else {
+            meter_apply_trim($dev, $trim + $dir);
+            $meter_hold  = $METER_SETTLE;
+            @meter_means = ();
+            $why .= sprintf(' - trimmed to %+d', $trim);
+        }
+    }
+    $meter_dir = $dir;
+
+    return sprintf('light meter: trim %+d, mean %d of target %d, white %.1f%%, black %.0f%% - %s',
+        $trim, $m, $mean_target, $hot * 100, $cold * 100, $why);
+}
+
  for (;;) { # I prefer using "for for infinite loops
 
 
@@ -411,6 +738,14 @@ print "Current Sunset Time Zone: " , $sunset_dt->strftime("%Z")   , "  updated o
 # sleep 0.8 to 0.7 seconds to reduce processor usage 
  #sleep(0.8);  # ( Never change this from 0.8 to 1 or else seconds will be skipped. )
 sleep(1) ;
+
+# One pass of the automatic light adjustment. It returns straight away except
+# every 5 seconds, and prints only when it has something to say, so the clock
+# display above is not buried.
+{
+    my $meter_line = meter_pass($meter_device);
+    print $meter_line, "\n" if defined $meter_line;
+}
 
 # clear the screen every 0.79 second:
 # #for ( sleep(0.79) ){
