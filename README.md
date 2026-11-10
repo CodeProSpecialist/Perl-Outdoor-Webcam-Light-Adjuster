@@ -20,6 +20,22 @@ different control families, so it suits an older webcam and a current one.
 -->
 <!-- ![The scheduler running](docs/screenshot-terminal.png) -->
 
+## Start this before the recording software
+
+**Run `perl-webcam-day-night-command.pl` first, then open Xeoma or whatever else records the camera.**
+
+That order is what makes the snapshots work. A V4L2 camera lets one program
+stream at a time, so the snapshot this program takes to measure the light can
+only be grabbed while the camera is still free. Start it first and it takes one
+every five seconds and corrects the light from them. Start the recorder first
+and the grab is impossible - the status line then names the program holding the
+camera, like `Xeoma (pid 2317) has /dev/video0`, and nothing is sent to the
+device while it is in use.
+
+The order stops mattering if the recording software writes its own stills into
+the snapshot folder, since those are measured just the same. Either arrangement
+works; one of them has to.
+
 ## Install
 
 Most of the Perl modules are packaged, which is much quicker than building them:
@@ -62,6 +78,8 @@ this wrong does not produce an error, it just measures nothing.
 ```
 perl perl-webcam-day-night-command.pl
 ```
+
+Start this before the recording software - see above for why.
 
 And, in another terminal, the Tk control window that pairs with it:
 
