@@ -1,6 +1,38 @@
 #!/usr/bin/perl
 use warnings;
 use strict;
+# First run: check the modules this script needs are installed, and offer to
+# install the apt packages that provide them if they are not. Nothing is
+# printed when they are all there, which is every run after the first.
+#
+# This has to happen in BEGIN, before the `use` lines below: `use` is a
+# compile-time step, so by the time ordinary code could check anything the
+# script has already died with "Can't locate ... in @INC". That error names
+# @INC and never names the apt package, which is the whole problem.
+#
+# WebcamBootstrap.pm is looked for next to this file, then in $HOME, then in
+# the working directory - the same order the scripts find each other - and if
+# it is not in any of them this does nothing and the `use` lines fail as they
+# always did. Set WEBCAM_NO_BOOTSTRAP=1 to skip the check.
+BEGIN {
+    require File::Basename;
+    require Cwd;
+
+    my @dirs = (
+        File::Basename::dirname(Cwd::abs_path(__FILE__)),
+        ($ENV{HOME} ? ($ENV{HOME}) : ()),
+        '.',
+    );
+
+    for my $dir (@dirs) {
+        next if !-r "$dir/WebcamBootstrap.pm";
+        unshift @INC, $dir;
+        require WebcamBootstrap;
+        WebcamBootstrap::ensure(qw(Tk));
+        last;
+    }
+}
+
 use Tk;
 
 my $mw = new MainWindow;

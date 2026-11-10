@@ -42,6 +42,38 @@ Perl 5.38 or newer, which is what Ubuntu ships: 5.38 on 24.04 and 5.40 on
 26.04. Use the distribution's own `/usr/bin/perl` - `perl -v` says which
 version is running.
 
+The programs check their own modules on the first run. Start one with a
+module missing and it names the module and the apt package that provides it,
+shows the command, and offers to run it:
+
+```
+webcam: these Perl modules are needed and not installed:
+  DateTime
+
+This can install them now with:
+
+    sudo apt-get -y install libdatetime-perl
+
+sudo will ask for your password.
+Install them? [y/N]
+```
+
+Answer anything but yes and it exits having changed nothing. Once they are
+installed it says nothing on any later run, and `sudo` is only ever invoked
+when something is actually missing - an ordinary start never asks for a
+password.
+
+Under cron, systemd or a pipe it does not ask and does not install: there is
+no terminal to answer on, and a prompt there would wait for an answer nobody
+can give while the scheduler silently never started. It prints the command and
+exits instead, so run it by hand once before putting any of this in a crontab.
+
+It only ever installs from apt, and only the packages below. The check lives in
+`WebcamBootstrap.pm`; `WEBCAM_NO_BOOTSTRAP=1` skips it, for a machine where
+the modules come from somewhere other than apt.
+
+To install them yourself first:
+
 Most of the Perl modules are packaged, which is much quicker than building them:
 
 ```
@@ -499,6 +531,7 @@ always did.
 |------|------------|
 | `perl-webcam-day-night-command.pl` | the scheduler, and the light meter loop |
 | `webcam-preset.pl` | the settings engine: reads the camera, applies a preset |
+| `WebcamBootstrap.pm` | the first-run check: names missing modules, offers the apt packages |
 | `webcam-GUI.pl` | the control window: every camera control, presets, light meter |
 | `Webcam-settings.pl` | the older, simpler button window |
 | `night-sharp-webcam.pl` | wrapper: night |
