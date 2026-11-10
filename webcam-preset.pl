@@ -15,11 +15,12 @@ use strict;
 # plugged in, picks the matching value table, and clamps every value to the
 # range that camera reports.
 #
-# Night brightness comes from a long manual exposure, not from the brightness
+# Night brightness comes from a long exposure, not from the brightness
 # control. brightness and gain saturate quickly; exposure is what collects
-# more light. The night preset asks for a long exposure, reads it back, and
-# steps down until the driver accepts one, because the driver silently clamps
-# any exposure that does not fit inside the current frame interval.
+# more light. The camera is left in aperture priority with the dynamic frame
+# rate allowed, so it lengthens its own exposure as the light drops rather
+# than being pinned to one value chosen at the moment the preset ran. See
+# $AE_MODE below for why that beats asking for a long manual exposure.
 
 my $preset = shift(@ARGV) || '';
 my $device = shift(@ARGV) || $ENV{WEBCAM_DEVICE} || '/dev/video0';
@@ -65,8 +66,24 @@ my $aepri_ctrl  = $modern ? 'exposure_dynamic_framerate'   : 'exposure_auto_prio
 my $focus_auto  = $modern ? 'focus_automatic_continuous'   : 'focus_auto';
 my $wb_auto     = $modern ? 'white_balance_automatic'      : 'white_balance_temperature_auto';
 
-# On both APIs the manual setting for auto exposure is 1.
-my $AE_MANUAL = 1;
+# Exposure mode, used by every preset on both cameras.
+#
+# Aperture priority (3) rather than manual (1), with the dynamic frame rate
+# allowed. The kernel documents EXPOSURE_AUTO_PRIORITY as only having any
+# effect while auto exposure is AUTO or APERTURE_PRIORITY - in manual mode it
+# does nothing at all - and what it does is let the driver drop the frame rate
+# so that a longer exposure fits. In manual mode the exposure can never exceed
+# the frame interval, so asking for a long one just got it clamped.
+#
+# Together these let the camera lengthen its own exposure past the frame
+# interval as the light drops, and keep adjusting through the night, instead of
+# being pinned to one value chosen when the preset ran.
+#
+# Set $AE_MODE back to 1 to return to manual, in which case the exposure
+# numbers in the tables below are sent and the search for the longest one the
+# driver accepts is used again. Both paths are kept working.
+my $AE_MODE        = 3;
+my $DYN_FRAMERATE  = 1;
 
 # Cold white balance on every preset.
 #
@@ -90,16 +107,16 @@ my %LEGACY = (
     # 7 rather than near maximum; 109 of 255 is the same proportion. Set
     # sharpness back to 250 here if you prefer the old look.
     night => {
-        sharpness => 109, brightness => 255, contrast => 54, saturation => 64,
+        sharpness => 109, brightness => 175, contrast => 223, saturation => 64,
         gain => 255, exposure => 2047, aepri => 1, focus => 51,
-        backlight_compensation => 255, zoom_absolute => 1,
+        backlight_compensation => 0, zoom_absolute => 1,
     },
     # Colour noise is most of what makes a dark frame look muddy, so this
     # trades colour for a cleaner, apparently brighter picture.
     night_mono => {
-        sharpness => 72, brightness => 255, contrast => 67, saturation => 0,
+        sharpness => 72, brightness => 175, contrast => 223, saturation => 0,
         gain => 255, exposure => 2047, aepri => 1, focus => 51,
-        backlight_compensation => 255, zoom_absolute => 1,
+        backlight_compensation => 0, zoom_absolute => 1,
     },
     # These four used to leave backlight_compensation out entirely, which meant
     # it was never sent and so kept whatever the last preset set. Coming off
@@ -130,15 +147,24 @@ my %LEGACY = (
 );
 
 my %MODERN = (
+    # Night brightness and contrast were retuned after measuring a real night
+    # frame from this camera. brightness on these webcams is a black level
+    # lift, not exposure: it collects no extra light, it only raises the floor.
+    # Set near maximum, as it was here, the darkest part of the frame sat at 97
+    # of 255 and the whole scene was squeezed into about 45 levels - grey fog
+    # with the subject invisible in it. Brightness is now well down and
+    # contrast well up, so the range is actually used, and the light comes from
+    # the aperture priority exposure instead. backlight_compensation is off at
+    # night for the same reason: it lifts shadows, which is more of the fog.
     night => {
-        sharpness => 3, brightness => 64, contrast => 20, saturation => 30,
+        sharpness => 3, brightness => 24, contrast => 56, saturation => 30,
         gain => 100, exposure => 5000, aepri => 0, focus => 51,
-        backlight_compensation => 12, zoom_absolute => 0,
+        backlight_compensation => 0, zoom_absolute => 0,
     },
     night_mono => {
-        sharpness => 2, brightness => 64, contrast => 25, saturation => 0,
+        sharpness => 2, brightness => 24, contrast => 56, saturation => 0,
         gain => 100, exposure => 5000, aepri => 0, focus => 51,
-        backlight_compensation => 12, zoom_absolute => 0,
+        backlight_compensation => 0, zoom_absolute => 0,
     },
     golden_am => {        sharpness => 5, brightness => 8, contrast => 28, saturation => 70,
         gain => 45, exposure => 350, aepri => 0, focus => 50,
@@ -261,9 +287,11 @@ printf("%s preset on %s (%s control names)\n",
 
 # Manual exposure first: on both APIs the exposure value is ignored while
 # auto exposure is on, and the driver needs a moment to switch over.
-set_ctrl($ae_ctrl, $AE_MANUAL);
+set_ctrl($ae_ctrl, $AE_MODE);
 sleep(1);
-set_ctrl($aepri_ctrl, $vals->{aepri});
+# Always on, on every preset, rather than the per-preset aepri value that used
+# to be sent here. It is what lets the driver trade frame rate for exposure.
+set_ctrl($aepri_ctrl, $DYN_FRAMERATE);
 
 set_ctrl('sharpness',              $vals->{sharpness});
 set_ctrl('brightness',             $vals->{brightness});
@@ -289,10 +317,22 @@ if (exists $ctl{'white_balance_temperature'}) {
 }
 
 # Exposure last, once the frame settings are in place.
-if ($preset eq 'night' || $preset eq 'night_mono') {
-    set_long_exposure($vals->{exposure});
+#
+# In aperture priority the camera sets its own exposure and the manual control
+# goes inactive, so there is nothing to send and nothing to search for. Read
+# back what it settled on instead, so the output still says what the camera is
+# actually doing.
+if ($AE_MODE == 1) {
+    if ($preset eq 'night' || $preset eq 'night_mono') {
+        set_long_exposure($vals->{exposure});
+    } else {
+        set_ctrl($exp_ctrl, $vals->{exposure});
+    }
 } else {
-    set_ctrl($exp_ctrl, $vals->{exposure});
+    sleep(1);                      # let the auto exposure settle before reading
+    my $got = get_ctrl($exp_ctrl);
+    printf("  %-30s %s (chosen by the camera, aperture priority)\n",
+        $exp_ctrl, defined $got ? $got : '?');
 }
 
 exit 0;
