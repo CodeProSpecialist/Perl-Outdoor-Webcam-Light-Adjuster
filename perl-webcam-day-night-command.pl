@@ -82,15 +82,153 @@ sub run_preset {
 
 
 
-# Location for Kansas 
-my $lat = "+39.403889"; ## N or S (+)
-my $lon = "-94.181667"; ## E or W (-)
+# Where this user's home directory is.
+#
+# $HOME is right nearly always, but it is not set under some cron and systemd
+# setups, which is exactly where this runs unattended - so the password
+# database is the fallback, and it answers for whichever user is actually
+# running the program. Nothing here has a user name written into it.
+sub home_dir {
+    return $ENV{HOME} if defined $ENV{HOME} && length $ENV{HOME} && -d $ENV{HOME};
+    my $pw = eval { (getpwuid($<))[7] };
+    return $pw if defined $pw && length $pw && -d $pw;
+    return '.';
+}
+
+# ---- Where this camera is ----
+#
+# The sunrise and sunset times depend on where you are, and nowhere in these
+# programs is there a place written down any more. The location is worked out
+# at startup, in this order, and the first answer wins:
+#
+#   1. WEBCAM_LAT and WEBCAM_LON in the environment, for a machine that should
+#      not be guessing at all - a camera on a tower a county away from the
+#      computer driving it, say.
+#   2. The cached answer in ~/.webcam-location.conf, if it is less than a week
+#      old. Nothing goes out to the network on an ordinary run.
+#   3. An IP lookup, which gives the city the connection comes out of.
+#   4. The last cached answer whatever its age, since a stale location beats
+#      none at all - sunrise moves by about a minute a day, not an hour.
+#
+# The IP lookup is worth being plain about: it tells a third party (ipinfo.io,
+# and ip-api.com if that one is not answering) this machine's IP address, and
+# what comes back is where the internet connection surfaces, not where the
+# camera is. On a VPN it is wrong by however far the VPN reaches. That is why
+# the answer is cached, shown, and overridable - and if neither is wanted, set
+# WEBCAM_LAT and WEBCAM_LON and no lookup is ever made.
+#
+# Accuracy only has to be rough. A tenth of a degree of latitude moves sunrise
+# by well under a minute, and these presets switch on offsets of 7 to 122
+# minutes, so a city-level answer is as good as a surveyed one here.
+
+my $LOCATION_FILE = $ENV{WEBCAM_LOCATION_FILE}
+    || (home_dir() . '/.webcam-location.conf');
+my $LOCATION_MAX_AGE = 7 * 24 * 3600;      # a week, then look again
+
+# The system's own idea of its time zone, which needs no network at all.
+sub system_timezone {
+    my $tz = `timedatectl show -p Timezone --value 2>/dev/null`;
+    chomp $tz if defined $tz;
+    return $tz if defined $tz && $tz =~ m{^[A-Za-z]+/};
+    if (open(my $fh, '<', '/etc/timezone')) {
+        my $line = <$fh>;
+        close($fh);
+        chomp $line if defined $line;
+        return $line if defined $line && $line =~ m{^[A-Za-z]+/};
+    }
+    my $link = readlink('/etc/localtime');
+    return $1 if defined $link && $link =~ m{zoneinfo/(\w+/[\w/+-]+)$};
+    return 'UTC';
+}
+
+sub save_location {
+    my ($la, $ln, $tz, $source) = @_;
+    open(my $fh, '>', $LOCATION_FILE) or return 0;
+    my @t = localtime();
+    printf {$fh} "lat=%s\nlon=%s\ntz=%s\nsource=%s\nsaved=%04d-%02d-%02d %02d:%02d\n",
+        $la, $ln, $tz, $source, $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1];
+    close($fh);
+    return 1;
+}
+
+# Returns (lat, lon, tz, source, age in seconds), or an empty list.
+sub load_location {
+    return () unless -f $LOCATION_FILE;
+    open(my $fh, '<', $LOCATION_FILE) or return ();
+    my %v;
+    while (my $line = <$fh>) {
+        $v{$1} = $2 if $line =~ /^(\w+)=(.*?)\s*$/;
+    }
+    close($fh);
+    return () unless defined $v{lat} && defined $v{lon};
+    my $age = time() - (stat($LOCATION_FILE))[9];
+    return ($v{lat}, $v{lon}, ($v{tz} || system_timezone()),
+            ($v{source} || 'saved'), $age);
+}
+
+# Ask where this connection comes out. Returns (lat, lon, tz) or nothing.
+#
+# Two services, because one of them is always rate limiting somebody. Short
+# timeouts: this runs at startup and must never be what stops the program
+# coming up.
+sub lookup_location_online {
+    return () unless system('command -v curl >/dev/null 2>&1') == 0;
+
+    my $json = `curl -s --max-time 6 https://ipinfo.io/json 2>/dev/null`;
+    if (defined $json && $json =~ /"loc"\s*:\s*"(-?[\d.]+),(-?[\d.]+)"/) {
+        my ($la, $ln) = ($1, $2);
+        my ($tz) = $json =~ /"timezone"\s*:\s*"([^"]+)"/;
+        return ($la, $ln, ($tz || system_timezone()));
+    }
+
+    $json = `curl -s --max-time 6 'http://ip-api.com/json/?fields=status,lat,lon,timezone' 2>/dev/null`;
+    if (defined $json && $json =~ /"status"\s*:\s*"success"/) {
+        my ($la) = $json =~ /"lat"\s*:\s*(-?[\d.]+)/;
+        my ($ln) = $json =~ /"lon"\s*:\s*(-?[\d.]+)/;
+        my ($tz) = $json =~ /"timezone"\s*:\s*"([^"]+)"/;
+        return ($la, $ln, ($tz || system_timezone())) if defined $la && defined $ln;
+    }
+    return ();
+}
+
+# The whole order above, in one call. Returns (lat, lon, tz, how it was found).
+sub detect_location {
+    my (%opt) = @_;
+
+    if (defined $ENV{WEBCAM_LAT} && defined $ENV{WEBCAM_LON}
+        && length $ENV{WEBCAM_LAT} && length $ENV{WEBCAM_LON}) {
+        my $tz = $ENV{WEBCAM_TZ} || system_timezone();
+        return ($ENV{WEBCAM_LAT}, $ENV{WEBCAM_LON}, $tz, 'WEBCAM_LAT and WEBCAM_LON');
+    }
+
+    my @saved = load_location();
+    if (@saved && !$opt{force} && $saved[4] < $LOCATION_MAX_AGE) {
+        return (@saved[0, 1, 2], 'the saved location');
+    }
+
+    my ($la, $ln, $tz) = lookup_location_online();
+    if (defined $la) {
+        save_location($la, $ln, $tz, 'ip lookup');
+        return ($la, $ln, $tz, 'an IP lookup');
+    }
+
+    # The lookup failed. A stale saved location beats none.
+    return (@saved[0, 1, 2], 'the saved location, which could not be refreshed')
+        if @saved;
+
+    return (undef, undef, system_timezone(), 'nothing - no saved location and no lookup');
+}
+
+# Worked out at startup - no place is written down in this file.
+my ($lat, $lon, $detected_tz, $location_how) = detect_location();
+my $sun_tzid = $detected_tz || system_timezone();
+
 
 
 # Current date
 my $now = DateTime->now;
 
-$now->set_time_zone('America/Chicago'); 
+$now->set_time_zone($sun_tzid); 
 
 my $fmt = "%H:%M:%S";
 
@@ -120,21 +258,7 @@ precise => 1
 # Every successful fetch or calculation is written to the shared file, so the
 # ONN settings GUI and the Python program can fall back on it as well.
 
-# Where this user's home directory is.
-#
-# $HOME is right nearly always, but it is not set under some cron and systemd
-# setups, which is exactly where this runs unattended - so the password
-# database is the fallback, and it answers for whichever user is actually
-# running the program. Nothing here has a user name written into it.
-sub home_dir {
-    return $ENV{HOME} if defined $ENV{HOME} && length $ENV{HOME} && -d $ENV{HOME};
-    my $pw = eval { (getpwuid($<))[7] };
-    return $pw if defined $pw && length $pw && -d $pw;
-    return '.';
-}
-
 my $sun_file = home_dir() . '/.webcam-sun-times.conf';
-my $sun_tzid = 'America/Chicago';
 
 sub save_sun_file {
     my ($sunrise_hhmm, $sunset_hhmm, $source) = @_;
@@ -245,7 +369,7 @@ my $sunrise_dt = DateTime->new(
     hour       => $sr_src->strftime("%H"),
     minute     => $sr_src->strftime("%M"),
     second     => $sr_src->strftime("%S"),
-    time_zone  => 'America/Chicago',
+    time_zone  => $sun_tzid,
 );
 
 # Remember that the "say" command will also print something with automatic spacing.  
@@ -261,7 +385,7 @@ my $sunset_dt = DateTime->new(
     hour       => $ss_src->strftime("%H"),
     minute     => $ss_src->strftime("%M"),
     second     => $ss_src->strftime("%S"),
-    time_zone  => 'America/Chicago',
+    time_zone  => $sun_tzid,
 );
 
 # Remember that the "say" command will also print something with automatic spacing.  
@@ -1463,14 +1587,14 @@ sleep(1);
 #######
 $timepiece = localtime;
 
-# Location for Kansas 
-my $lat = "+39.403889"; ## N or S (+)
-my $lon = "-94.181667"; ## E or W (-)
+# The detected $lat and $lon from the top of the file are still in scope here.
+# This used to re-declare them with a hard-coded place, which inside the loop
+# meant the detected location was thrown away on the first pass.
 
 # Current date
  $now = DateTime->now;
 
-$now->set_time_zone('America/Chicago');
+$now->set_time_zone($sun_tzid);
 
 
 
@@ -1503,7 +1627,7 @@ precise => 1
     hour       => $sr_src->strftime("%H"),
     minute     => $sr_src->strftime("%M"),
     second     => $sr_src->strftime("%S"),
-    time_zone  => 'America/Chicago',
+    time_zone  => $sun_tzid,
 );
 
 # Remember that the "say" command will also print something with automatic spacing.  
@@ -1519,7 +1643,7 @@ precise => 1
     hour       => $ss_src->strftime("%H"),
     minute     => $ss_src->strftime("%M"),
     second     => $ss_src->strftime("%S"),
-    time_zone  => 'America/Chicago',
+    time_zone  => $sun_tzid,
 );
 
 
