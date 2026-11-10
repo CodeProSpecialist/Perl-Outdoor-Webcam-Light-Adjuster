@@ -982,6 +982,8 @@ sub meter_read_ctrls {
 my $SNAP_KEEP = 30;          # snapshots to keep; the oldest beyond this go
 my $snap_capture_note = '';  # set once, so a busy camera is not shouted about
 my $snap_capture_tried = 0;
+my $snap_busy_until = 0;     # when the camera is held, stop asking for a while
+my $SNAP_BUSY_WAIT = 60;
 
 # mkdir -p, without pulling in File::Path for one line.
 sub make_dir_path {
@@ -1028,6 +1030,52 @@ sub prune_snapshots {
     return $to_go;
 }
 
+# Who has the camera open, if anyone.
+#
+# This exists because of how the two programs actually get used: the snapshot
+# grab works when this program is started BEFORE the recording software, and
+# stops working the moment that software opens the device - a V4L2 camera
+# lets one program stream at a time.
+#
+# Knowing that is worth more than retrying blindly. If the recorder has the
+# camera, running ffmpeg at it every five seconds achieves nothing, and there
+# is a real risk in it: if the recorder drops and re-opens its stream at the
+# instant our grab lands, our grab wins and the recorder fails to come back.
+# So when something else holds the device, nothing is sent to it at all.
+#
+# fuser and lsof both answer this; whichever is installed is used, and if
+# neither is, the grab is simply attempted as before.
+sub camera_holder {
+    my ($dev) = @_;
+    return undef unless -e $dev;
+
+    if (system('command -v fuser >/dev/null 2>&1') == 0) {
+        my $out = `fuser -v $dev 2>&1`;
+        my %names;
+        for my $line (split /\n/, ($out || '')) {
+            # fuser -v lines look like:  USER  PID  ACCESS  COMMAND
+            next unless $line =~ /^\s*\S*\s+(\d+)\s+\S+\s+(\S+)\s*$/;
+            my ($pid, $name) = ($1, $2);
+            next if $pid == $$;
+            $names{"$name (pid $pid)"} = 1;
+        }
+        return join(', ', sort keys %names) if %names;
+    }
+
+    if (system('command -v lsof >/dev/null 2>&1') == 0) {
+        my $out = `lsof -F cp $dev 2>/dev/null`;
+        my ($pid, %names);
+        for my $line (split /\n/, ($out || '')) {
+            $pid = $1 if $line =~ /^p(\d+)/;
+            if ($line =~ /^c(\S+)/ && defined $pid && $pid != $$) {
+                $names{"$1 (pid $pid)"} = 1;
+            }
+        }
+        return join(', ', sort keys %names) if %names;
+    }
+    return undef;
+}
+
 # Grab one frame into the snapshot folder. Returns the path, or undef when the
 # camera is busy, ffmpeg is missing, or there is no folder to write to.
 sub capture_snapshot {
@@ -1049,6 +1097,19 @@ sub capture_snapshot {
     # ffmpeg missing is the one thing that will not fix itself, so that one
     # stops here.
     return undef if $snap_capture_note =~ /not installed/;
+
+    # Something else has the camera. Say who, leave the device alone, and look
+    # again in a minute rather than every five seconds.
+    my $holder = camera_holder($dev);
+    if (defined $holder) {
+        $snap_capture_note =
+            "$holder has $dev - snapshots come from the recording software while it runs";
+        meter_log("camera held by $holder, not grabbing");
+        $snap_busy_until = time() + $SNAP_BUSY_WAIT;
+        return undef;
+    }
+    return undef if time() < $snap_busy_until;
+
     $snap_capture_note = '';
 
     my @t = localtime();
