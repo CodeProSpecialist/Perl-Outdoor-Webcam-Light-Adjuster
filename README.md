@@ -38,6 +38,10 @@ works; one of them has to.
 
 ## Install
 
+Perl 5.38 or newer, which is what Ubuntu ships: 5.38 on 24.04 and 5.40 on
+26.04. Use the distribution's own `/usr/bin/perl` - `perl -v` says which
+version is running.
+
 Most of the Perl modules are packaged, which is much quicker than building them:
 
 ```
