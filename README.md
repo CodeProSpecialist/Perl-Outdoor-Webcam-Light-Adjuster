@@ -1,6 +1,7 @@
 # Perl Outdoor Webcam Light Adjuster
 
-Automatically adjusts an outdoor USB webcam's settings in Ubuntu Linux: it
+Automatically adjusts an outdoor USB webcam's settings in Ubuntu Linux, 24.04
+and 26.04: it
 switches between tuned presets on today's real sunrise and sunset times, and
 corrects whichever preset is in force by measuring the picture the camera is
 actually producing. Written for a 1080p HD USB webcam, and it drives two
@@ -21,8 +22,16 @@ different control families, so it suits an older webcam and a current one.
 
 ## Install
 
-The Perl modules, one at a time with cpan. Some take close to an hour to build,
-depending on the machine and the connection:
+Most of the Perl modules are packaged, which is much quicker than building them:
+
+```
+sudo apt-get -y install libdatetime-perl libdatetime-event-sunrise-perl
+```
+
+`Time::Piece` and `Time::Seconds` come with Perl itself, and
+`DateTime::Duration` comes with `DateTime`. For anything apt does not have, or
+on an older release, cpan builds them - one at a time, and some take close to
+an hour depending on the machine and the connection:
 
 ```
 cpan
@@ -39,8 +48,14 @@ Then the system packages:
 sudo apt-get -y install v4l-utils perl-tk imagemagick ffmpeg curl
 ```
 
-`imagemagick` is what measures the picture for the automatic light adjustment.
-Without it the schedule still runs; only the correction stays idle.
+`imagemagick` measures the picture for the automatic light adjustment and
+`ffmpeg` takes the snapshots. Without them the schedule still runs; only the
+correction stays idle, and it says which one is missing.
+
+On Ubuntu 26.04 the `imagemagick` package installs ImageMagick 7, whose command
+is `magick`; 24.04 and earlier install version 6, whose command is `convert`.
+Either is accepted - the command name is worked out at startup, because getting
+this wrong does not produce an error, it just measures nothing.
 
 ## Run
 

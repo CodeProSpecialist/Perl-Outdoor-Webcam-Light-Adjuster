@@ -722,14 +722,37 @@ sub meter_snapshot {
 # averaging is exactly what shrinking an image does. The clipping figures are
 # taken at full size, where a count of individual blown pixels still means
 # something.
+# Which ImageMagick is installed.
+#
+# ImageMagick 7, which is what Ubuntu 26.04 ships, dropped the `convert`
+# command in favour of `magick`; ImageMagick 6, on 24.04 and earlier, has
+# `convert` and no `magick`. The arguments are the same either way, so it is
+# only the command name that has to be worked out - once, and then remembered.
+# Without this the measuring silently finds nothing on a newer Ubuntu and the
+# light meter sits there reporting no snapshot.
+my $MAGICK;
+sub magick_cmd {
+    return $MAGICK if defined $MAGICK;
+    for my $try ('magick', 'convert') {
+        if (system("command -v $try >/dev/null 2>&1") == 0) {
+            $MAGICK = $try;
+            return $MAGICK;
+        }
+    }
+    $MAGICK = '';
+    return $MAGICK;
+}
+
 sub meter_measure {
     my ($f) = @_;
     return () unless defined $f;
-    my $mean = `convert "$f" -colorspace Gray -resize 25% -format "%[fx:mean*255]" info: 2>/dev/null`;
+    my $im = magick_cmd();
+    return () unless length $im;
+    my $mean = `$im "$f" -colorspace Gray -resize 25% -format "%[fx:mean*255]" info: 2>/dev/null`;
     return () unless defined $mean && $mean =~ /([\d.]+)/;
     $mean = $1;
-    my $hot  = `convert "$f" -colorspace Gray -threshold 97% -format "%[fx:mean]" info: 2>/dev/null`;
-    my $warm = `convert "$f" -colorspace Gray -threshold 3%  -format "%[fx:mean]" info: 2>/dev/null`;
+    my $hot  = `$im "$f" -colorspace Gray -threshold 97% -format "%[fx:mean]" info: 2>/dev/null`;
+    my $warm = `$im "$f" -colorspace Gray -threshold 3%  -format "%[fx:mean]" info: 2>/dev/null`;
     $hot  = ($hot  =~ /([\d.]+)/) ? $1 : 0;
     $warm = ($warm =~ /([\d.]+)/) ? $1 : 1;
     # -threshold keeps what is ABOVE the level, so the black fraction is what
@@ -878,6 +901,8 @@ sub meter_pass {
     my $frame = meter_snapshot();
     my ($mean, $hot, $cold) = meter_measure($frame);
     unless (defined $mean) {
+        return 'light meter: ImageMagick is not installed, so the picture cannot be measured'
+            unless length magick_cmd();
         return 'light meter: no snapshot to measure, the preset stands as it is'
              . (length $snap_capture_note ? " - $snap_capture_note" : '');
     }
