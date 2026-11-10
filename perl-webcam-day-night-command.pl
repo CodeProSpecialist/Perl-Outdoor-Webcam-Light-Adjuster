@@ -40,7 +40,7 @@ use Cwd ();
 sub run_preset {
     my ($script) = @_;
     my @dirs = (File::Basename::dirname(Cwd::abs_path($0)),
-                ($ENV{HOME} || '.'),
+                home_dir(),
                 Cwd::getcwd());
     for my $dir (@dirs) {
         my $path = "$dir/$script";
@@ -120,7 +120,20 @@ precise => 1
 # Every successful fetch or calculation is written to the shared file, so the
 # ONN settings GUI and the Python program can fall back on it as well.
 
-my $sun_file = ($ENV{HOME} || '.') . '/.webcam-sun-times.conf';
+# Where this user's home directory is.
+#
+# $HOME is right nearly always, but it is not set under some cron and systemd
+# setups, which is exactly where this runs unattended - so the password
+# database is the fallback, and it answers for whichever user is actually
+# running the program. Nothing here has a user name written into it.
+sub home_dir {
+    return $ENV{HOME} if defined $ENV{HOME} && length $ENV{HOME} && -d $ENV{HOME};
+    my $pw = eval { (getpwuid($<))[7] };
+    return $pw if defined $pw && length $pw && -d $pw;
+    return '.';
+}
+
+my $sun_file = home_dir() . '/.webcam-sun-times.conf';
 my $sun_tzid = 'America/Chicago';
 
 sub save_sun_file {
@@ -391,10 +404,24 @@ my $meter_device = $ENV{WEBCAM_DEVICE} || '/dev/video0';
 #
 # Needs ImageMagick for the measuring: sudo apt install imagemagick
 
-# The folder the recording software writes its stills into. WEBCAM_SNAPSHOT
-# overrides it; this is the default so that nothing needs setting for the
-# camera these programs were written for.
-my $SNAP_DEFAULT = '/home/x800/Pictures/onn-webcam/program-snapshots-for-auto-adjust-picture';
+# Where this user's home directory is.
+#
+# $HOME is right nearly always, but it is not set under some cron and systemd
+# setups, which is exactly where this runs unattended - so the password
+# database is the fallback, and it answers for whichever user is actually
+# running the program. Nothing here has a user name written into it.
+sub meter_home_dir {
+    return $ENV{HOME} if defined $ENV{HOME} && length $ENV{HOME} && -d $ENV{HOME};
+    my $pw = eval { (getpwuid($<))[7] };
+    return $pw if defined $pw && length $pw && -d $pw;
+    return '.';
+}
+
+# The folder the snapshots live in, under whoever's home directory this is.
+# WEBCAM_SNAPSHOT overrides it. It is created at startup if it is not there,
+# parent folders and all.
+my $SNAP_DEFAULT = meter_home_dir()
+    . '/Pictures/onn-webcam/program-snapshots-for-auto-adjust-picture';
 
 my $snap_src = $ENV{WEBCAM_SNAPSHOT} || $SNAP_DEFAULT;
 my $snap_tmp = '/tmp/.webcam-meter.jpg';
@@ -402,8 +429,8 @@ my $snap_tmp = '/tmp/.webcam-meter.jpg';
 # Directories worth looking in when nothing is configured.
 my @snap_guess = (
     $SNAP_DEFAULT,
-    ($ENV{HOME} || '.') . '/webcam-snapshots',
-    ($ENV{HOME} || '.') . '/.xeoma/snapshots',
+    meter_home_dir() . '/webcam-snapshots',
+    meter_home_dir() . '/.xeoma/snapshots',
     '/opt/Xeoma/snapshots',
     '/tmp/webcam-snapshots',
 );
