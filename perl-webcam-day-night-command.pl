@@ -804,8 +804,7 @@ sub meter_log_path { return $LOG_FILE; }
 # The folder the snapshots live in, under whoever's home directory this is.
 # WEBCAM_SNAPSHOT overrides it. It is created at startup if it is not there,
 # parent folders and all.
-my $SNAP_DEFAULT = meter_home_dir()
-    . '/Pictures/onn-webcam/program-snapshots-for-auto-adjust-picture';
+my $SNAP_DEFAULT = meter_home_dir() . '/Pictures/webcam-sample-images';
 
 my $snap_src = $ENV{WEBCAM_SNAPSHOT} || $SNAP_DEFAULT;
 my $snap_tmp = '/tmp/.webcam-meter.jpg';
@@ -813,6 +812,10 @@ my $snap_tmp = '/tmp/.webcam-meter.jpg';
 # Directories worth looking in when nothing is configured.
 my @snap_guess = (
     $SNAP_DEFAULT,
+    # Where this used to put them. Kept so that an installation that has
+    # been filling that folder for months is still found rather than
+    # starting over with nothing to measure.
+    meter_home_dir() . '/Pictures/onn-webcam/program-snapshots-for-auto-adjust-picture',
     meter_home_dir() . '/webcam-snapshots',
     meter_home_dir() . '/.xeoma/snapshots',
     '/opt/Xeoma/snapshots',
