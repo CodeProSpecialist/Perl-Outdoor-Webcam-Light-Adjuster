@@ -278,8 +278,8 @@ my @snap_guess = (
 # writes, and a loop that acts faster than its own feedback arrives will
 # oscillate - the picture breathes in and out all night instead of settling.
 # Ten seconds of patience is what buys the settling.
-my $METER_EVERY  = 5;
-my $METER_SETTLE = 2;
+my $METER_EVERY  = 30;
+my $METER_SETTLE = 1;
 
 # What a good picture looks like, as numbers.
 #
@@ -1408,14 +1408,14 @@ $c2->Label(-text => 'Error log: ' . meter_log_path(), -anchor => 'w',
     -font => 'Helvetica 8', -wraplength => 310, -fg => '#555')
     ->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);
 
-# meter_pass only does work every 5 seconds and returns nothing in between, so
+# meter_pass only does work every 30 seconds and returns nothing in between, so
 # checking every 2 keeps the window responsive and costs nothing.
 sub meter_tick {
     if ($meter_on) {
         my $line = meter_pass($device);
         $meter_status->configure(-text => $line) if defined $line;
     }
-    $mw->after(2000, \&meter_tick);
+    $mw->after(5000, \&meter_tick);
 }
 $mw->after(6000, \&meter_tick);
 
