@@ -967,6 +967,219 @@ sub meter_pass {
         $trim, $m, $mean_target, $hot * 100, $cold * 100, $why);
 }
 
+# ---- The terminal at the bottom of the window ----
+#
+# Eighty columns by fifteen lines, with the day and night scheduler running in
+# it, so the window shows what the schedule is actually doing and not only
+# what has been pressed here. It is read-only: the scheduler takes no input,
+# and a text box that cannot be typed into cannot be scrolled away from the
+# newest line by a stray keystroke.
+#
+# Perl/Tk has one thread and one event loop, and a blocking read on a pipe
+# inside that loop would freeze every widget until the next line arrived.
+# fileevent is the way round it: the event loop watches the pipe itself and
+# calls back only when there is something to be read, so this costs nothing
+# at all while the scheduler is quiet, which is most of the day.
+
+my $TERM_COLS      = 80;
+my $TERM_ROWS      = 15;
+my $TERM_MAX_LINES = 2000;   # scrollback kept before the oldest lines go
+my $TERM_SCRIPT    = 'perl-webcam-day-night-command.pl';
+
+my %term;
+
+# Next to this file, then the home directory, then the working directory - the
+# same order run_preset uses, and for the same reason: these files get copied
+# to ~ and run from either place.
+sub term_find {
+    my ($filename) = @_;
+    for my $dir (File::Basename::dirname(Cwd::abs_path($0)), home_dir(), Cwd::getcwd()) {
+        return "$dir/$filename" if -r "$dir/$filename";
+    }
+    return undef;
+}
+
+sub term_write {
+    my ($line) = @_;
+    my $text = $term{text} or return;
+    # Follow the newest line only when the view is already at the bottom, so
+    # that scrolling back to read something is not yanked away again by the
+    # next line arriving.
+    my @view = $text->yview;
+    my $at_bottom = ($view[1] >= 0.999);
+    $text->configure(-state => 'normal');
+    $text->insert('end', $line);
+    my $lines = int($text->index('end-1c'));
+    if ($lines > $TERM_MAX_LINES) {
+        $text->delete('1.0', ($lines - $TERM_MAX_LINES + 1) . '.0');
+    }
+    $text->configure(-state => 'disabled');
+    $text->see('end') if $at_bottom;
+}
+
+sub term_clear {
+    my $text = $term{text} or return;
+    $text->configure(-state => 'normal');
+    $text->delete('1.0', 'end');
+    $text->configure(-state => 'disabled');
+}
+
+sub term_start {
+    return if $term{pid};
+    my $path = $term{path} ||= term_find($term{file});
+    if (!defined $path) {
+        term_write("$term{file} was not found next to $0, in " . home_dir()
+            . ", or in " . Cwd::getcwd() . ".\n");
+        $term{status}->configure(-text => 'not found', -fg => '#a00');
+        return;
+    }
+
+    # stdbuf keeps the output coming a line at a time. Writing to a pipe makes
+    # a program buffer in blocks instead of lines, and a block of log an hour
+    # from now is no use in a window meant to show what is happening; where
+    # stdbuf is not installed the lines still arrive, just in batches.
+    # 2>&1 because the warnings are the half of the output most worth seeing.
+    my $quote = sub { my $s = shift; $s =~ s/'/'\\''/g; "'$s'" };
+    my $cmd = (-x '/usr/bin/stdbuf' ? 'stdbuf -oL -eL ' : '')
+        . $quote->($^X) . ' ' . $quote->($path) . ' 2>&1';
+
+    my $fh;
+    my $pid = open($fh, '-|', 'sh', '-c', "exec $cmd");
+    if (!$pid) {
+        term_write("could not start $path: $!\n");
+        $term{status}->configure(-text => 'failed to start', -fg => '#a00');
+        return;
+    }
+    $term{fh}       = $fh;
+    $term{pid}      = $pid;
+    $term{stopping} = 0;
+    term_write('--- ' . File::Basename::basename($path) . " started, pid $pid ---\n");
+    $term{status}->configure(-text => "running, pid $pid", -fg => '#060');
+    $term{mw}->fileevent($fh, 'readable', \&term_readable);
+}
+
+sub term_readable {
+    my $fh = $term{fh} or return;
+    my $line = <$fh>;
+    if (defined $line) {
+        term_write($line);
+        return;
+    }
+    # Nothing more to come: the child has closed its end and finished.
+    eval { $term{mw}->fileevent($fh, 'readable', '') };
+    close $fh;
+    my $status = $? >> 8;
+    delete $term{fh};
+    delete $term{pid};
+    term_write("--- exited, status $status ---\n");
+    $term{status}->configure(
+        -text => $term{stopping} ? 'stopped' : "exited, status $status",
+        -fg   => $term{stopping} ? '#555'    : '#a00',
+    );
+}
+
+sub term_stop {
+    my $pid = $term{pid};
+    if (!$pid) {
+        $term{status}->configure(-text => 'not running', -fg => '#555') if $term{status};
+        return;
+    }
+    $term{stopping} = 1;
+    # Ask first: the scheduler may be part way through writing to the camera,
+    # and it gets to finish. Insist only if it ignores the asking.
+    kill 'TERM', $pid;
+    my $reaped = 0;
+    for (1 .. 30) {
+        if (waitpid($pid, 1) == $pid) { $reaped = 1; last }
+        select undef, undef, undef, 0.1;
+    }
+    if (!$reaped) {
+        kill 'KILL', $pid;
+        waitpid($pid, 0);
+    }
+    if (my $fh = delete $term{fh}) {
+        eval { $term{mw}->fileevent($fh, 'readable', '') };
+        close $fh;
+    }
+    delete $term{pid};
+    $term{status}->configure(-text => 'stopped', -fg => '#555');
+}
+
+sub term_restart { term_stop(); term_start(); }
+
+# How much of the window height the terminal takes, so that the scrolling area
+# above it can be given what is left of the screen rather than the whole of
+# it - otherwise the window opens taller than the screen and the terminal is
+# pushed off the bottom edge, which is where it is least use.
+sub term_height {
+    return 0 unless $term{frame};
+    $term{frame}->update;
+    return $term{frame}->reqheight;
+}
+
+sub build_terminal {
+    my ($mw, $filename) = @_;
+    %term = (mw => $mw, file => $filename);
+
+    my $frame = $mw->Frame(-borderwidth => 1, -relief => 'sunken');
+    $frame->pack(-side => 'bottom', -fill => 'x', -padx => 4, -pady => 3);
+    $term{frame} = $frame;
+
+    my $bar = $frame->Frame->pack(-fill => 'x');
+    $bar->Label(-text => $filename, -font => 'Helvetica 9 bold')
+        ->pack(-side => 'left', -padx => 4);
+    $term{status} = $bar->Label(-text => 'starting', -font => 'Helvetica 8', -fg => '#036');
+    $term{status}->pack(-side => 'left', -padx => 4);
+    $bar->Button(-text => 'Clear', -font => 'Helvetica 8', -command => \&term_clear)
+        ->pack(-side => 'right', -padx => 2);
+    $bar->Button(-text => 'Restart', -font => 'Helvetica 8', -command => \&term_restart)
+        ->pack(-side => 'right', -padx => 2);
+    $bar->Button(-text => 'Stop', -font => 'Helvetica 8', -command => \&term_stop)
+        ->pack(-side => 'right', -padx => 2);
+
+    # The horizontal scrollbar is packed before the body, because pack hands
+    # out space in the order it is asked and the body expands into whatever is
+    # left - ask the other way round and the scrollbar gets squeezed to
+    # nothing.
+    my $hscroll = $frame->Scrollbar(-orient => 'horizontal');
+    $hscroll->pack(-side => 'bottom', -fill => 'x');
+
+    my $body = $frame->Frame->pack(-fill => 'both', -expand => 1);
+    my $text = $body->Text(
+        -width            => $TERM_COLS,
+        -height           => $TERM_ROWS,
+        -wrap             => 'none',
+        -font             => 'Courier 9',
+        -background       => '#101010',
+        -foreground       => '#d0d0d0',
+        -insertbackground => '#d0d0d0',
+        -highlightthickness => 0,
+        -state            => 'disabled',
+    );
+    my $vscroll = $body->Scrollbar(-orient => 'vertical',
+        -command => [ 'yview', $text ], -width => 16);
+    $hscroll->configure(-command => [ 'xview', $text ]);
+    $text->configure(-yscrollcommand => [ 'set', $vscroll ],
+                     -xscrollcommand => [ 'set', $hscroll ]);
+    $text->pack(-side => 'left', -fill => 'both', -expand => 1);
+    $vscroll->pack(-side => 'right', -fill => 'y');
+    $term{text} = $text;
+
+    # The wheel bindings for the controls above are on the toplevel, which
+    # child widgets inherit, so without a break here the wheel over the
+    # terminal would scroll the controls behind it instead of the log.
+    $text->bind('<Button-4>', sub { $text->yview('scroll', -3, 'units'); Tk->break });
+    $text->bind('<Button-5>', sub { $text->yview('scroll',  3, 'units'); Tk->break });
+    $text->bind('<MouseWheel>', [ sub {
+        my ($widget, $delta) = @_;
+        $text->yview('scroll', ($delta > 0 ? -3 : 3), 'units');
+        Tk->break;
+    }, Tk::Ev('D') ]);
+
+    term_start();
+    return $frame;
+}
+
 # ---- The window ----
 
 my $mw = MainWindow->new(-title => 'Webcam Settings');
@@ -983,8 +1196,12 @@ $mw->Label(-text => $cam_line, -font => 'Helvetica 9', -fg => '#036')->pack;
 my $scroll_area = $mw->Frame;
 my $canvas = $scroll_area->Canvas(-highlightthickness => 0, -takefocus => 1)
     ->pack(-side => 'left', -fill => 'both', -expand => 1);
-my $vbar = $scroll_area->Scrollbar(-orient => 'vertical', -command => ['yview', $canvas])
+# Wide enough to get hold of with the mouse - this is the slider for the
+# camera settings above, and it is used often enough to be worth the pixels.
+my $vbar = $scroll_area->Scrollbar(-orient => 'vertical', -command => ['yview', $canvas],
+    -width => 18)
     ->pack(-side => 'right', -fill => 'y');
+build_terminal($mw, $TERM_SCRIPT);
 my $hbar = $mw->Scrollbar(-orient => 'horizontal', -command => ['xview', $canvas])
     ->pack(-side => 'bottom', -fill => 'x');
 $canvas->configure(-yscrollcommand => ['set', $vbar], -xscrollcommand => ['set', $hbar]);
@@ -1205,7 +1422,8 @@ $mw->after(6000, \&meter_tick);
 $mw->update;
 my $want_w = $cols->reqwidth;
 my $want_h = $cols->reqheight;
-my $max_h  = int($mw->screenheight * 0.88);
+my $max_h  = int($mw->screenheight * 0.88) - term_height();
+$max_h = 200 if $max_h < 200;
 my $max_w  = int($mw->screenwidth  * 0.98);
 $want_w = $max_w if $want_w > $max_w;
 $canvas->configure(
@@ -1213,5 +1431,9 @@ $canvas->configure(
     -height => ($want_h > $max_h ? $max_h : $want_h),
     -scrollregion => [ $canvas->bbox('all') ],
 );
+
+# Take the scheduler with us. Without this the child process in the terminal
+# would outlive the window that started it.
+$mw->protocol('WM_DELETE_WINDOW', sub { term_stop(); $mw->destroy });
 
 MainLoop;
