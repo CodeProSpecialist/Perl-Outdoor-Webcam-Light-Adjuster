@@ -1755,7 +1755,7 @@ $c2->Label(-text => 'Error log: ' . meter_log_path(), -anchor => 'w',
 $c2->Label(-text => '--- Night Image Enhancement ---', -font => 'Helvetica 10 bold')
     ->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -pady => 5);
 
-my ($enh_night, $enh_all_day) = (0, 0);
+my ($enh_night, $enh_all_day, $enh_detect) = (0, 0, 0);
 my $enh_status;
 if (enhance_module()) {
     # Both start at whatever they were left at, not at off: the scheduler has
@@ -1764,18 +1764,26 @@ if (enhance_module()) {
     my $saved = WebcamEnhance::read_settings();
     $enh_night   = $saved->{ WebcamEnhance::key_night() }   ? 1 : 0;
     $enh_all_day = $saved->{ WebcamEnhance::key_all_day() } ? 1 : 0;
+    $enh_detect  = $saved->{ WebcamEnhance::key_detect()  } ? 1 : 0;
 }
 
 sub enhance_summary {
-    return 'Correcting every snapshot, around the clock.' if $enh_all_day;
-    return 'Correcting snapshots once the gain says it is dark.' if $enh_night;
-    return 'Image correction off - the snapshots are left as the camera wrote them.';
+    my $line =
+        $enh_all_day ? 'Correcting every snapshot, around the clock.'
+      : $enh_night   ? 'Correcting snapshots once the gain says it is dark.'
+      : 'Image correction off - the snapshots are left as the camera wrote them.';
+    return $line unless $enh_night || $enh_all_day;
+    $line .= ' Cars and people get a second lift and a crop of their own.'
+        if $enh_detect;
+    return $line;
 }
 
 # Write both switches out, so the scheduler sees the change too.
 sub on_enhance_toggle {
     return unless enhance_module();
-    my $ok = WebcamEnhance::write_settings(night => $enh_night, all_day => $enh_all_day);
+    my $ok = WebcamEnhance::write_settings(night   => $enh_night,
+                                           all_day => $enh_all_day,
+                                           detect  => $enh_detect);
     my $text = enhance_summary();
     $text .= ' (could not write ' . WebcamEnhance::conf_file() . ')' unless $ok;
     $enh_status->configure(-text => $text) if $enh_status;
@@ -1810,11 +1818,24 @@ if (enhance_module()) {
         -command  => \&on_enhance_toggle,
     )->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);
 
+    $c2->Checkbutton(
+        -text     => 'find cars and people and enhance them',
+        -variable => \$enh_detect,
+        -font     => 'Helvetica 8',
+        -anchor   => 'w',
+        -command  => \&on_enhance_toggle,
+    )->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);
+
     $c2->Label(
         -text => "The first box only runs it once the gain is past half its range,\n"
                . "which is the same test the sharpness uses for night - a floodlit\n"
                . "yard at midnight does not get it and an overcast dusk does. The\n"
-               . "second runs it on every still around the clock and overrides the\nfirst.",
+               . "second runs it on every still around the clock and overrides the\nfirst.\n\n"
+               . "The third looks for cars and people in the corrected still and\n"
+               . "gives them a second, stronger lift of their own, saving a close\n"
+               . "crop of each into a \"detections\" folder. It runs after the\n"
+               . "correction on purpose: a detector sees nothing in a raw night\n"
+               . "frame, and finds what is there once the frame has been lifted.",
         -anchor => 'w', -justify => 'left', -font => 'Helvetica 8',
         -wraplength => 310, -fg => '#555')
         ->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);

@@ -80,6 +80,10 @@ our $CONF_FILE = $ENV{WEBCAM_ENHANCE_CONF} || home_dir() . '/.webcam-enhance.con
 # The same two key names the Python version writes, so one file serves both.
 our $KEY_NIGHT   = 'night_clahe_ml';
 our $KEY_ALL_DAY = 'all_day_clahe_ml';
+# Find the car or the person and aim a second, stronger correction at them.
+# Independent of the two above: it only does anything on a frame that is being
+# corrected at all, because the detector needs the correction to see.
+our $KEY_DETECT  = 'detect_and_boost';
 
 # How many consecutive stills to average, and how old the oldest of them may
 # be. The window matters: stills twenty minutes apart are two different scenes
@@ -110,13 +114,14 @@ our $CLAHE_TILES = 8;
 # a package variable it has not seen declared yet.
 sub key_night    { return $KEY_NIGHT; }
 sub key_all_day  { return $KEY_ALL_DAY; }
+sub key_detect   { return $KEY_DETECT; }
 sub conf_file    { return $CONF_FILE; }
 sub stack_depth   { return $STACK_FRAMES; }
 
 # ---- the two switches ----
 
 sub read_settings {
-    my %on = ($KEY_NIGHT => 0, $KEY_ALL_DAY => 0);
+    my %on = ($KEY_NIGHT => 0, $KEY_ALL_DAY => 0, $KEY_DETECT => 0);
     open my $fh, '<', $CONF_FILE or return \%on;
     while (my $line = <$fh>) {
         next if $line =~ /^\s*#/;
@@ -136,12 +141,15 @@ sub write_settings {
     my $on = read_settings();
     $on->{$KEY_NIGHT}   = $args{night}   ? 1 : 0 if exists $args{night};
     $on->{$KEY_ALL_DAY} = $args{all_day} ? 1 : 0 if exists $args{all_day};
+    $on->{$KEY_DETECT}  = $args{detect}  ? 1 : 0 if exists $args{detect};
     open my $fh, '>', $CONF_FILE or return 0;
     print {$fh} "# Written by the webcam settings window. Two switches:\n";
     print {$fh} "#   night image CLAHE and ML auto correct\n";
     print {$fh} "#   24 hour image CLAHE and ML auto correct\n";
+    print {$fh} "#   find cars and people and enhance them\n";
     print {$fh} "$KEY_NIGHT=$on->{$KEY_NIGHT}\n";
     print {$fh} "$KEY_ALL_DAY=$on->{$KEY_ALL_DAY}\n";
+    print {$fh} "$KEY_DETECT=$on->{$KEY_DETECT}\n";
     close $fh or return 0;
     return 1;
 }
