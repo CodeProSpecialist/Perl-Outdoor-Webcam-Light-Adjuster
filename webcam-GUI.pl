@@ -720,6 +720,82 @@ sub magick_cmd {
     return $MAGICK;
 }
 
+# ---- Night image enhancement (frame averaging, CLAHE, brain G) ----
+#
+# A separate module because it is a separate kind of work: it never touches the
+# camera, it only reads the stills in the picture folder that the loop below
+# has already measured. With WebcamEnhance.pm missing, everything here carries
+# on exactly as it did before it existed.
+my $ENHANCE;
+sub enhance_module {
+    return $ENHANCE if defined $ENHANCE;
+    $ENHANCE = 0;
+    # Next to this script first, then the home directory, then the working
+    # directory - the same order the preset wrappers use, because these files
+    # get copied to ~ and run from either place.
+    my @where = ('.', meter_home_dir());
+    if ($0 =~ m{^(.*)/[^/]+$}) { unshift @where, $1; }
+    for my $dir (@where) {
+        next unless -f "$dir/WebcamEnhance.pm";
+        local @INC = (@INC, $dir);
+        if (eval { require WebcamEnhance; 1 }) {
+            $ENHANCE = 1;
+            last;
+        }
+    }
+    return $ENHANCE;
+}
+
+# How far up its own range the gain is sitting, 0 to 1, or undef.
+#
+# This is the one honest test of how dark it actually is. The clock says what
+# time it is; the gain says whether the camera is struggling, which is what the
+# enhancement needs to know - a floodlit yard at midnight needs none of it and
+# an overcast dusk may need all of it. It is the same test the sharpness uses,
+# so the two agree about when night has started.
+sub enhance_gain_fraction {
+    my ($dev) = @_;
+    return undef unless $ctrl_range{gain};
+    my ($glo, $ghi) = @{ $ctrl_range{gain} };
+    return undef unless $ghi > $glo;
+    my $now = defined $meter_wrote{gain} ? $meter_wrote{gain} : get_ctrl($dev, 'gain');
+    return undef unless defined $now && $now =~ /^-?\d+$/;
+    my $fraction = ($now - $glo) / ($ghi - $glo);
+    $fraction = 0 if $fraction < 0;
+    $fraction = 1 if $fraction > 1;
+    return $fraction;
+}
+
+# Hand the current still to the enhancer. Returns a status line, or nothing.
+#
+# This is deliberately kept well away from everything else: it reads a file and
+# writes a file, and it sends nothing to the camera. A failure in here cannot
+# affect the correction loop, and the corrected copies go into their own
+# subfolder so that the next pass still measures the camera's own output rather
+# than measuring its own correction and chasing it.
+sub meter_enhance {
+    my ($dev, $frame, $mean) = @_;
+    return undef unless enhance_module();
+    my ($line, $note) = (undef, '');
+    my $ok = eval {
+        ($line, $note) = WebcamEnhance::enhance_pass(
+            frame         => $frame,
+            folder        => snap_dir(),
+            gain_fraction => enhance_gain_fraction($dev),
+            mean          => $mean,
+        );
+        1;
+    };
+    unless ($ok) {
+        my $why = $@ || 'unknown error';
+        $why =~ s/\s+at\s+\S+\s+line\s+\d+.*//s;
+        meter_log("enhancement failed: $why");
+        return "enhance: failed - $why";
+    }
+    meter_log($line) if defined $line;
+    return $line;
+}
+
 sub meter_measure {
     my ($f) = @_;
     return () unless defined $f;
@@ -920,6 +996,12 @@ sub meter_pass {
              . (length $snap_capture_note ? " - $snap_capture_note" : '');
     }
 
+    # The corrected copy of this still, when either switch is on. This is not
+    # part of the correction loop - it changes no control and the recording is
+    # untouched by it - so it happens here, once the frame is in hand and
+    # measured, and whatever it says is added to the status line.
+    my $enhanced = meter_enhance($dev, $frame, $mean);
+
     # Median of the last three keeps a passing pair of headlights from
     # dragging the picture darker for the next minute.
     push @meter_means, $mean;
@@ -966,8 +1048,11 @@ sub meter_pass {
     }
     $meter_dir = $dir;
 
-    return sprintf('light meter: trim %+d, mean %d of target %d, white %.1f%%, black %.0f%% - %s',
+    my $status = sprintf(
+        'light meter: trim %+d, mean %d of target %d, white %.1f%%, black %.0f%% - %s',
         $trim, $m, $mean_target, $hot * 100, $cold * 100, $why);
+    $status .= " | $enhanced" if defined $enhanced;
+    return $status;
 }
 
 # ---- The terminal at the bottom of the window ----
@@ -1120,12 +1205,88 @@ sub term_height {
     return $term{frame}->reqheight;
 }
 
+# ---- Brain G's tile, under the terminal ----
+#
+# A trained model is otherwise completely opaque: there is no way to tell from
+# the picture whether the brain loaded, whether it is the one that shipped or
+# one retrained on this camera, or whether it is any good. So every number it
+# was judged on goes on the screen, including the score a flat "lift everything
+# the same amount" answer got, which is the only honest way to read the others.
+my %brain_tile;
+
+sub build_brain_tile {
+    my ($parent) = @_;
+
+    my $frame = $parent->Frame(-borderwidth => 1, -relief => 'sunken');
+    $frame->pack(-side => 'top', -fill => 'x', -padx => 4, -pady => 3);
+    $brain_tile{frame} = $frame;
+
+    my $bar = $frame->Frame->pack(-fill => 'x');
+    $bar->Label(-text => 'brain G - the night vision brain',
+                -font => 'Helvetica 9 bold')->pack(-side => 'left', -padx => 4);
+    $brain_tile{status} = $bar->Label(-text => 'reading the brain...',
+                                      -font => 'Helvetica 8', -fg => '#036');
+    $brain_tile{status}->pack(-side => 'left', -padx => 4);
+    # Worth having: retraining happens in a terminal while this window is open,
+    # and this is how the window notices.
+    $bar->Button(-text => 'Refresh', -font => 'Helvetica 8',
+                 -command => \&refresh_brain_tile)->pack(-side => 'right', -padx => 2);
+
+    my $body = $frame->Frame->pack(-fill => 'both', -expand => 1);
+    my $text = $body->Text(
+        -width => $TERM_COLS, -height => 22, -wrap => 'word',
+        -font => 'Monospace 9', -background => '#101820', -foreground => '#cfd8dc',
+        -highlightthickness => 0,
+    );
+    my $vscroll = $body->Scrollbar(-orient => 'vertical', -command => ['yview', $text],
+                                   -width => 16);
+    $text->configure(-yscrollcommand => ['set', $vscroll]);
+    $text->pack(-side => 'left', -fill => 'both', -expand => 1);
+    $vscroll->pack(-side => 'right', -fill => 'y');
+    $brain_tile{text} = $text;
+
+    # The wheel bindings for the page are on the window, so without these the
+    # wheel over this tile would scroll the page behind it instead of the tile.
+    $text->bind('<Button-4>', sub { $text->yview('scroll', -3, 'units'); Tk->break });
+    $text->bind('<Button-5>', sub { $text->yview('scroll',  3, 'units'); Tk->break });
+
+    refresh_brain_tile();
+    return $frame;
+}
+
+sub refresh_brain_tile {
+    return unless $brain_tile{text};
+    my ($headline, $body);
+    if (enhance_module()) {
+        my $ok = eval { ($headline, $body) = WebcamEnhance::brain_info_text(); 1 };
+        unless ($ok) {
+            my $why = $@ || 'unknown error';
+            $why =~ s/\s+at\s+\S+\s+line\s+\d+.*//s;
+            ($headline, $body) = ('could not read the brain', "$why\n");
+        }
+    } else {
+        ($headline, $body) = (
+            'no enhancement module',
+            "WebcamEnhance.pm was not found next to this script, in "
+          . meter_home_dir() . ",\nor in the working directory, so there is no image "
+          . "correction and no brain.\n");
+    }
+    $brain_tile{status}->configure(-text => $headline);
+    $brain_tile{text}->configure(-state => 'normal');
+    $brain_tile{text}->delete('1.0', 'end');
+    $brain_tile{text}->insert('end', $body);
+    # Read-only: the program's output comes in, nothing is typed back.
+    $brain_tile{text}->configure(-state => 'disabled');
+    return 1;
+}
+
 sub build_terminal {
-    my ($mw, $filename) = @_;
+    my ($mw, $filename, $side) = @_;
+    $side ||= 'bottom';
     %term = (mw => $mw, file => $filename);
 
     my $frame = $mw->Frame(-borderwidth => 1, -relief => 'sunken');
-    $frame->pack(-side => 'bottom', -fill => 'x', -padx => 4, -pady => 3);
+    $frame->pack(-side => $side, -fill => 'x', -padx => 4, -pady => 3);
     $term{frame} = $frame;
 
     my $bar = $frame->Frame->pack(-fill => 'x');
@@ -1204,19 +1365,23 @@ my $canvas = $scroll_area->Canvas(-highlightthickness => 0, -takefocus => 1)
 my $vbar = $scroll_area->Scrollbar(-orient => 'vertical', -command => ['yview', $canvas],
     -width => 18)
     ->pack(-side => 'right', -fill => 'y');
-build_terminal($mw, $TERM_SCRIPT);
 my $hbar = $mw->Scrollbar(-orient => 'horizontal', -command => ['xview', $canvas])
     ->pack(-side => 'bottom', -fill => 'x');
 $canvas->configure(-yscrollcommand => ['set', $vbar], -xscrollcommand => ['set', $hbar]);
 $scroll_area->pack(-fill => 'both', -expand => 1);
 
-my $cols = $canvas->Frame;
-my $cols_id = $canvas->createWindow(0, 0, -window => $cols, -anchor => 'nw');
-$cols->bind('<Configure>', sub { $canvas->configure(-scrollregion => [ $canvas->bbox('all') ]) });
+# The page. Everything below the heading lives in here, stacked top to bottom
+# like a tall web page: the camera controls and presets side by side, then the
+# scheduler's terminal, then the brain's tile. The scrollbar down the right
+# hand side moves all of it together. A Frame cannot scroll itself, so the page
+# goes into the canvas as a canvas window and the canvas scrolls it.
+my $page = $canvas->Frame;
+my $cols_id = $canvas->createWindow(0, 0, -window => $page, -anchor => 'nw');
+$page->bind('<Configure>', sub { $canvas->configure(-scrollregion => [ $canvas->bbox('all') ]) });
 $canvas->bind('<Configure>', sub {
     my $width = $canvas->width;
     return if $width <= 1;
-    my $needed = $cols->reqwidth;
+    my $needed = $page->reqwidth;
     $canvas->itemconfigure($cols_id, -width => ($width > $needed ? $width : $needed));
 });
 $mw->bind('<Button-4>', sub { $canvas->yview('scroll', -3, 'units') });
@@ -1230,8 +1395,17 @@ $mw->bind('<Prior>', sub { $canvas->yview('scroll', -1, 'pages') });
 $mw->bind('<Home>',  sub { $canvas->yview('moveto', 0) });
 $mw->bind('<End>',   sub { $canvas->yview('moveto', 1) });
 
+# The two columns at the top of the page: controls on the left, presets and
+# the switches on the right.
+my $cols = $page->Frame->pack(-side => 'top', -fill => 'x', -anchor => 'nw');
 my $c1 = $cols->Frame->pack(-side => 'left', -anchor => 'n', -padx => 6);
 my $c2 = $cols->Frame->pack(-side => 'left', -anchor => 'n', -padx => 6);
+
+# Then the scheduler's terminal, then brain G's tile under it. Both pack into
+# the page itself rather than the window, which is what puts them in the
+# scrolling flow instead of pinning them to the bottom edge.
+build_terminal($page, $TERM_SCRIPT, 'top');
+build_brain_tile($page);
 my ($r1, $r2) = (0, 0);
 
 # ---- Column one: a control for everything the camera reported ----
@@ -1408,6 +1582,131 @@ $c2->Label(-text => 'Error log: ' . meter_log_path(), -anchor => 'w',
     -font => 'Helvetica 8', -wraplength => 310, -fg => '#555')
     ->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);
 
+# ---- Night image enhancement: the two switches ----
+#
+# A different kind of thing from everything above, and worth keeping apart.
+# Everything else in this window sends values to the camera and so changes what
+# gets recorded. This does not touch the camera at all: it reads the stills in
+# the picture folder, averages the newest few to cancel the sensor noise,
+# equalizes them tile by tile and lifts what is left, writing the result into an
+# "enhanced" folder beside them. The recording is unchanged - what this gives is
+# a far more readable set of stills of the same scene.
+$c2->Label(-text => '--- Night Image Enhancement ---', -font => 'Helvetica 10 bold')
+    ->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -pady => 5);
+
+my ($enh_night, $enh_all_day) = (0, 0);
+my $enh_status;
+if (enhance_module()) {
+    # Both start at whatever they were left at, not at off: the scheduler has
+    # been running on them all night and the window should show what is
+    # actually in force rather than resetting it.
+    my $saved = WebcamEnhance::read_settings();
+    $enh_night   = $saved->{ WebcamEnhance::key_night() }   ? 1 : 0;
+    $enh_all_day = $saved->{ WebcamEnhance::key_all_day() } ? 1 : 0;
+}
+
+sub enhance_summary {
+    return 'Correcting every snapshot, around the clock.' if $enh_all_day;
+    return 'Correcting snapshots once the gain says it is dark.' if $enh_night;
+    return 'Image correction off - the snapshots are left as the camera wrote them.';
+}
+
+# Write both switches out, so the scheduler sees the change too.
+sub on_enhance_toggle {
+    return unless enhance_module();
+    my $ok = WebcamEnhance::write_settings(night => $enh_night, all_day => $enh_all_day);
+    my $text = enhance_summary();
+    $text .= ' (could not write ' . WebcamEnhance::conf_file() . ')' unless $ok;
+    $enh_status->configure(-text => $text) if $enh_status;
+    return 1;
+}
+
+if (enhance_module()) {
+    $c2->Label(
+        -text => "Works on the snapshots in the picture folder above, not on the\n"
+               . 'camera: the newest ' . WebcamEnhance::stack_depth() . ' stills are averaged '
+               . "together, which\ncancels most of the sensor noise, then CLAHE pulls "
+               . "detail out of\nthe shadows a tile at a time and brain G lifts what is "
+               . "left.\nThe corrected copies go in an \"enhanced\" folder beside the\n"
+               . "originals. The recording itself is not changed by this, and\nthe light "
+               . "meter goes on measuring the camera's own stills.",
+        -anchor => 'w', -justify => 'left', -font => 'Helvetica 8', -wraplength => 310)
+        ->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);
+
+    $c2->Checkbutton(
+        -text     => 'night image CLAHE and ML auto correct',
+        -variable => \$enh_night,
+        -font     => 'Helvetica 8',
+        -anchor   => 'w',
+        -command  => \&on_enhance_toggle,
+    )->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);
+
+    $c2->Checkbutton(
+        -text     => '24 hour image CLAHE and ML auto correct',
+        -variable => \$enh_all_day,
+        -font     => 'Helvetica 8',
+        -anchor   => 'w',
+        -command  => \&on_enhance_toggle,
+    )->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);
+
+    $c2->Label(
+        -text => "The first box only runs it once the gain is past half its range,\n"
+               . "which is the same test the sharpness uses for night - a floodlit\n"
+               . "yard at midnight does not get it and an overcast dusk does. The\n"
+               . "second runs it on every still around the clock and overrides the\nfirst.",
+        -anchor => 'w', -justify => 'left', -font => 'Helvetica 8',
+        -wraplength => 310, -fg => '#555')
+        ->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);
+
+    $c2->Label(-text => WebcamEnhance::report(), -anchor => 'w', -justify => 'left',
+               -font => 'Helvetica 8', -wraplength => 310, -fg => '#036')
+        ->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);
+
+    # Pressing the button is itself the instruction, so this does not consult
+    # the switches - it is how to see what the correction does to tonight's
+    # picture before leaving it running on a schedule.
+    $c2->Button(-text => 'Correct one now', -font => 'Helvetica 8', -command => sub {
+        my $frame = meter_snapshot();
+        unless (defined $frame) {
+            $enh_status->configure(-text => 'No snapshot to correct'
+                . (length $snap_capture_note ? " - $snap_capture_note" : ''));
+            return;
+        }
+        my ($written, $how) = ('', '');
+        my $ok = eval {
+            ($written, $how) = WebcamEnhance::enhance_now($frame, snap_dir());
+            1;
+        };
+        unless ($ok) {
+            my $why = $@ || 'unknown error';
+            $why =~ s/\s+at\s+\S+\s+line\s+\d+.*//s;
+            $enh_status->configure(-text => "Could not correct it: $why");
+            return;
+        }
+        if (length $written) {
+            my $name = $written;
+            $name =~ s{^.*/}{};
+            my $dir = $written;
+            $dir =~ s{/[^/]+$}{};
+            $enh_status->configure(-text => "Wrote $name in $dir - $how");
+        } else {
+            $enh_status->configure(-text => "Could not correct it: $how");
+        }
+        refresh_brain_tile();
+    })->grid(-row => $r2++, -column => 0, -sticky => 'w', -padx => 6, -pady => 2);
+
+    $enh_status = $c2->Label(-text => enhance_summary(), -anchor => 'w',
+        -justify => 'left', -font => 'Helvetica 8', -wraplength => 310);
+    $enh_status->grid(-row => $r2++, -column => 0, -columnspan => 2,
+                      -sticky => 'w', -padx => 6);
+} else {
+    $c2->Label(
+        -text => "WebcamEnhance.pm was not found next to this script, so there is\n"
+               . "no image correction. Everything else still works.",
+        -anchor => 'w', -justify => 'left', -font => 'Helvetica 8', -wraplength => 310)
+        ->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);
+}
+
 # meter_pass only does work every 30 seconds and returns nothing in between, so
 # checking every 2 keeps the window responsive and costs nothing.
 sub meter_tick {
@@ -1420,13 +1719,16 @@ sub meter_tick {
 $mw->after(6000, \&meter_tick);
 
 
-# Open at the size the controls ask for, but never taller than the screen will
-# take - which is the whole reason for the scrollbars.
+# Open at the size the page asks for, but never taller than the screen will
+# take - which is the whole reason for the scrollbar.
 $mw->update;
-my $want_w = $cols->reqwidth;
-my $want_h = $cols->reqheight;
-my $max_h  = int($mw->screenheight * 0.88) - term_height();
-$max_h = 200 if $max_h < 200;
+my $want_w = $page->reqwidth;
+my $want_h = $page->reqheight;
+# The page is a tall one now - controls, terminal, brain tile - and it will not
+# fit on any screen, any more than a web page does. It opens showing the top of
+# itself and the scrollbar reaches the rest.
+my $max_h  = int($mw->screenheight * 0.86);
+$max_h = 300 if $max_h < 300;
 my $max_w  = int($mw->screenwidth  * 0.98);
 $want_w = $max_w if $want_w > $max_w;
 $canvas->configure(

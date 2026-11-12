@@ -1270,6 +1270,82 @@ sub magick_cmd {
     return $MAGICK;
 }
 
+# ---- Night image enhancement (frame averaging, CLAHE, brain G) ----
+#
+# A separate module because it is a separate kind of work: it never touches the
+# camera, it only reads the stills in the picture folder that the loop below
+# has already measured. With WebcamEnhance.pm missing, everything here carries
+# on exactly as it did before it existed.
+my $ENHANCE;
+sub enhance_module {
+    return $ENHANCE if defined $ENHANCE;
+    $ENHANCE = 0;
+    # Next to this script first, then the home directory, then the working
+    # directory - the same order the preset wrappers use, because these files
+    # get copied to ~ and run from either place.
+    my @where = ('.', meter_home_dir());
+    if ($0 =~ m{^(.*)/[^/]+$}) { unshift @where, $1; }
+    for my $dir (@where) {
+        next unless -f "$dir/WebcamEnhance.pm";
+        local @INC = (@INC, $dir);
+        if (eval { require WebcamEnhance; 1 }) {
+            $ENHANCE = 1;
+            last;
+        }
+    }
+    return $ENHANCE;
+}
+
+# How far up its own range the gain is sitting, 0 to 1, or undef.
+#
+# This is the one honest test of how dark it actually is. The clock says what
+# time it is; the gain says whether the camera is struggling, which is what the
+# enhancement needs to know - a floodlit yard at midnight needs none of it and
+# an overcast dusk may need all of it. It is the same test the sharpness uses,
+# so the two agree about when night has started.
+sub enhance_gain_fraction {
+    my ($dev) = @_;
+    return undef unless $ctrl_range{gain};
+    my ($glo, $ghi) = @{ $ctrl_range{gain} };
+    return undef unless $ghi > $glo;
+    my $now = defined $meter_wrote{gain} ? $meter_wrote{gain} : get_ctrl($dev, 'gain');
+    return undef unless defined $now && $now =~ /^-?\d+$/;
+    my $fraction = ($now - $glo) / ($ghi - $glo);
+    $fraction = 0 if $fraction < 0;
+    $fraction = 1 if $fraction > 1;
+    return $fraction;
+}
+
+# Hand the current still to the enhancer. Returns a status line, or nothing.
+#
+# This is deliberately kept well away from everything else: it reads a file and
+# writes a file, and it sends nothing to the camera. A failure in here cannot
+# affect the correction loop, and the corrected copies go into their own
+# subfolder so that the next pass still measures the camera's own output rather
+# than measuring its own correction and chasing it.
+sub meter_enhance {
+    my ($dev, $frame, $mean) = @_;
+    return undef unless enhance_module();
+    my ($line, $note) = (undef, '');
+    my $ok = eval {
+        ($line, $note) = WebcamEnhance::enhance_pass(
+            frame         => $frame,
+            folder        => snap_dir(),
+            gain_fraction => enhance_gain_fraction($dev),
+            mean          => $mean,
+        );
+        1;
+    };
+    unless ($ok) {
+        my $why = $@ || 'unknown error';
+        $why =~ s/\s+at\s+\S+\s+line\s+\d+.*//s;
+        meter_log("enhancement failed: $why");
+        return "enhance: failed - $why";
+    }
+    meter_log($line) if defined $line;
+    return $line;
+}
+
 sub meter_measure {
     my ($f) = @_;
     return () unless defined $f;
@@ -1470,6 +1546,12 @@ sub meter_pass {
              . (length $snap_capture_note ? " - $snap_capture_note" : '');
     }
 
+    # The corrected copy of this still, when either switch is on. This is not
+    # part of the correction loop - it changes no control and the recording is
+    # untouched by it - so it happens here, once the frame is in hand and
+    # measured, and whatever it says is added to the status line.
+    my $enhanced = meter_enhance($dev, $frame, $mean);
+
     # Median of the last three keeps a passing pair of headlights from
     # dragging the picture darker for the next minute.
     push @meter_means, $mean;
@@ -1516,8 +1598,11 @@ sub meter_pass {
     }
     $meter_dir = $dir;
 
-    return sprintf('light meter: trim %+d, mean %d of target %d, white %.1f%%, black %.0f%% - %s',
+    my $status = sprintf(
+        'light meter: trim %+d, mean %d of target %d, white %.1f%%, black %.0f%% - %s',
         $trim, $m, $mean_target, $hot * 100, $cold * 100, $why);
+    $status .= " | $enhanced" if defined $enhanced;
+    return $status;
 }
 
 # The startup probe: ask this camera what its controls can actually do before
