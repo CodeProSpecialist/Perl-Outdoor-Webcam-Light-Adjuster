@@ -1276,6 +1276,17 @@ sub term_height {
 # the same amount" answer got, which is the only honest way to read the others.
 my %brain_tile;
 
+# The two training switches. Declared here, above the tile that draws them,
+# because that is where the subs below can see them - and they are read off the
+# conf file rather than started at off, so the window shows what the scheduler
+# has actually been doing rather than resetting it on every open.
+my ($train_pics, $train_cam) = (1, 0);
+if (enhance_module()) {
+    my $saved = WebcamEnhance::read_settings();
+    $train_pics = $saved->{ WebcamEnhance::key_train_pictures() } ? 1 : 0;
+    $train_cam  = $saved->{ WebcamEnhance::key_train_camera()   } ? 1 : 0;
+}
+
 sub build_brain_tile {
     my ($parent) = @_;
 
@@ -1316,6 +1327,65 @@ sub build_brain_tile {
         -wraplength => 420,
     )->pack(-side => 'left', -padx => 6);
 
+    # ---- where the brain trains from ----
+    #
+    # Two boxes rather than one, because the two sources are not equivalent and
+    # on this machine only one of them is usually available. The picture folder
+    # is always there: the light meter has been filling it with frames of the
+    # real scene in the real light, which is exactly what makes this brain
+    # better than a general one. The camera is the better source in principle -
+    # frames straight off the sensor, no JPEG round trip - and is only possible
+    # while nothing else holds the device, which on a machine that is recording
+    # is rarely.
+    #
+    # Ticking a box trains from it now and leaves it selected, so the automatic
+    # retrain uses the same source. The scheduler reads the same conf file, so
+    # a box ticked here means the same thing to the process running under cron.
+    my $train_frame = $frame->Frame(-borderwidth => 1, -relief => 'groove');
+    $train_frame->pack(-fill => 'x', -padx => 4, -pady => 3);
+    $train_frame->Label(-text => 'where the brain trains from',
+                        -font => 'Helvetica 9 bold', -anchor => 'w')
+        ->pack(-fill => 'x', -padx => 4);
+
+    $brain_tile{train_pics_box} = $train_frame->Checkbutton(
+        -text     => 'train brain from ' . $SNAP_DEFAULT,
+        -variable => \$train_pics,
+        -font     => 'Helvetica 8',
+        -anchor   => 'w',
+        -command  => sub { on_train_toggle('pictures') },
+    );
+    $brain_tile{train_pics_box}->pack(-fill => 'x', -padx => 6);
+
+    $brain_tile{train_cam_box} = $train_frame->Checkbutton(
+        -text     => 'train brain direct from the detected webcamera',
+        -variable => \$train_cam,
+        -font     => 'Helvetica 8',
+        -anchor   => 'w',
+        -command  => sub { on_train_toggle('camera') },
+    );
+    $brain_tile{train_cam_box}->pack(-fill => 'x', -padx => 6);
+
+    my $train_row = $train_frame->Frame->pack(-fill => 'x', -padx => 6, -pady => 2);
+    $brain_tile{train_now} = $train_row->Button(
+        -text => 'Train now from the ticked sources', -font => 'Helvetica 8',
+        -command => \&on_train_now,
+    );
+    $brain_tile{train_now}->pack(-side => 'left');
+    $brain_tile{train_status} = $train_row->Label(
+        -text => train_summary(), -font => 'Helvetica 8', -anchor => 'w',
+        -justify => 'left', -wraplength => 360, -fg => '#036');
+    $brain_tile{train_status}->pack(-side => 'left', -padx => 6);
+
+    $train_frame->Label(
+        -text => "The camera box can only work while nothing else has the\n"
+               . "camera: a V4L2 device lets one program stream at a time, so\n"
+               . "while the recording software is running it is held and the\n"
+               . "picture folder is the source that is actually available. The\n"
+               . "box says who has it rather than failing quietly.",
+        -font => 'Helvetica 8', -anchor => 'w', -justify => 'left',
+        -wraplength => 420, -fg => '#555',
+    )->pack(-fill => 'x', -padx => 6, -pady => 2);
+
     my $body = $frame->Frame->pack(-fill => 'both', -expand => 1);
     my $text = $body->Text(
         -width => $TERM_COLS, -height => 22, -wrap => 'word',
@@ -1336,6 +1406,137 @@ sub build_brain_tile {
 
     refresh_brain_tile();
     return $frame;
+}
+
+# One line saying what the two boxes add up to.
+sub train_summary {
+    return 'no enhancement module, so there is nothing to train'
+        unless enhance_module();
+    return 'Both boxes off - the brain is not being trained.'
+        unless $train_pics || $train_cam;
+    my @from;
+    push @from, 'the camera'         if $train_cam;
+    push @from, 'the picture folder' if $train_pics;
+    return 'Training from ' . join(' and then ', @from) . '.';
+}
+
+# A box was ticked or unticked. Write it out so the scheduler agrees, then -
+# when it was just ticked - train from it, because ticking it is the
+# instruction and waiting until tomorrow's automatic retrain to act on it would
+# look like the box did nothing.
+sub on_train_toggle {
+    my ($which) = @_;
+    unless (enhance_module()) {
+        $brain_tile{train_status}->configure(
+            -text => 'WebcamEnhance.pm is not here, so there is nothing to train')
+            if $brain_tile{train_status};
+        return;
+    }
+    my $ok = WebcamEnhance::write_settings(train_pictures => $train_pics,
+                                           train_camera   => $train_cam);
+    my $text = train_summary();
+    $text .= ' (could not write ' . WebcamEnhance::conf_file() . ')' unless $ok;
+    $brain_tile{train_status}->configure(-text => $text)
+        if $brain_tile{train_status};
+
+    # Only act on a box being turned ON. Unticking one is a instruction to stop
+    # using that source, and starting a training run on the way out would be
+    # the opposite of what was asked.
+    my $turned_on = ($which eq 'camera') ? $train_cam : $train_pics;
+    on_train_now() if $turned_on;
+    return 1;
+}
+
+# Train from whichever boxes are ticked.
+#
+# As a child process writing to a log, polled on a timer, for the same reason
+# the reset button does it that way: training takes a minute or two and a
+# minute or two of work inside the event loop is a window that has stopped
+# repainting. The camera burst happens here in the parent, before the child
+# starts - it is a couple of seconds, and the child needs the frames to already
+# be on disk.
+sub on_train_now {
+    return unless enhance_module();
+    return if $brain_tile{busy};
+
+    unless ($train_pics || $train_cam) {
+        $brain_tile{train_status}->configure(
+            -text => 'Neither box is ticked, so there is nothing to train from.');
+        return;
+    }
+    unless (length WebcamEnhance::trainer_script()) {
+        $brain_tile{train_status}->configure(
+            -text => 'train_webcam_brain.py is not here with a python3 to run it');
+        return;
+    }
+
+    my ($sources, $note);
+    my $ok = eval {
+        ($sources, $note) = WebcamEnhance::training_sources(
+            device => $device,
+            folder => snap_dir(),
+        );
+        1;
+    };
+    unless ($ok) {
+        my $why = $@ || 'unknown error';
+        $why =~ s/\s+at\s+\S+\s+line\s+\d+.*//s;
+        $brain_tile{train_status}->configure(-text => "Could not start: $why");
+        return;
+    }
+    unless (@$sources) {
+        $brain_tile{train_status}->configure(
+            -text => length $note ? $note : 'nothing to train from');
+        meter_log("training not started: $note") if length $note;
+        return;
+    }
+
+    # One command per source, run in order, so a folder that fails does not
+    # take the other one down with it.
+    my @cmds;
+    my @labels;
+    for my $pair (@$sources) {
+        my ($label, $dir) = @$pair;
+        my $cmd = WebcamEnhance::train_from_photos_command($dir);
+        next unless length $cmd;
+        push @labels, $label;
+        push @cmds, "echo '--- training from $label: $dir ---'; $cmd";
+    }
+    unless (@cmds) {
+        $brain_tile{train_status}->configure(-text => 'nothing to train from');
+        return;
+    }
+
+    $brain_tile{busy} = 1;
+    $brain_tile{reset}->configure(-state => 'disabled');
+    $brain_tile{train_now}->configure(-state => 'disabled');
+    my $from = join(' and ', @labels);
+    $brain_tile{train_status}->configure(
+        -text => "Training from $from, this takes a minute or two..."
+               . (length $note ? " ($note)" : ''));
+    meter_log("training from $from" . (length $note ? " - $note" : ''), always => 1);
+
+    my $log = '/tmp/.webcam-brain-train.log';
+    unlink $log;
+    $brain_tile{log} = $log;
+
+    my $pid = fork();
+    if (!defined $pid) {
+        $brain_tile{busy} = 0;
+        $brain_tile{reset}->configure(-state => 'normal');
+        $brain_tile{train_now}->configure(-state => 'normal');
+        $brain_tile{train_status}->configure(-text => 'could not start the training');
+        return;
+    }
+    if ($pid == 0) {
+        # exec, not system, so there is one process and the parent's waitpid
+        # sees it finish. The || is what keeps perl from warning that the exit
+        # is unreachable.
+        exec('sh', '-c', join('; ', @cmds) . " >$log 2>&1") || exit 1;
+    }
+    $brain_tile{pid} = $pid;
+    $brain_tile{mw}->after(600, \&poll_reset_brain);
+    return 1;
 }
 
 # Delete the brain and train a new one from the harvest.
@@ -1408,6 +1609,10 @@ sub poll_reset_brain {
     $brain_tile{busy} = 0;
     $brain_tile{pid} = undef;
     $brain_tile{reset}->configure(-state => 'normal');
+    $brain_tile{train_now}->configure(-state => 'normal')
+        if $brain_tile{train_now};
+    $brain_tile{train_status}->configure(-text => train_summary())
+        if $brain_tile{train_status};
     refresh_brain_tile();
     return 1;
 }

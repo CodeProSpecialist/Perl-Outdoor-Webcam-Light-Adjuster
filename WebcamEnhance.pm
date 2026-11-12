@@ -85,6 +85,29 @@ our $KEY_ALL_DAY = 'all_day_clahe_ml';
 # corrected at all, because the detector needs the correction to see.
 our $KEY_DETECT  = 'detect_and_boost';
 
+# Where the brain's training frames come from. Two switches, because the two
+# sources are not the same kind of thing and a camera that is held by the
+# recorder can only offer the first of them.
+#
+#   train_from_pictures - train on the snapshot folder, which is what the
+#       light meter has been filling all along: real frames of the real scene
+#       in the real light, which is the whole reason this brain beats a general
+#       one. This is the one to leave on.
+#
+#   train_from_camera - grab a short burst off the camera itself and train on
+#       that. Only possible while the camera is free: a V4L2 device lets one
+#       program stream at a time, so when the recording software holds it this
+#       finds nothing and says who has it rather than failing quietly.
+our $KEY_TRAIN_PICTURES = 'train_from_pictures';
+our $KEY_TRAIN_CAMERA   = 'train_from_camera';
+
+# The burst taken off the camera when training direct from it: how many frames
+# and how far apart. Spread over a few seconds rather than grabbed back to
+# back, because ten frames of one instant are one frame as far as training is
+# concerned.
+our $BURST_FRAMES   = $ENV{WEBCAM_BURST_FRAMES}  || 12;
+our $BURST_SPACING  = 0.75;
+
 # How many consecutive stills to average, and how old the oldest of them may
 # be. The window matters: stills twenty minutes apart are two different scenes
 # and averaging them smears one over the other. Three minutes at the
@@ -115,13 +138,20 @@ our $CLAHE_TILES = 8;
 sub key_night    { return $KEY_NIGHT; }
 sub key_all_day  { return $KEY_ALL_DAY; }
 sub key_detect   { return $KEY_DETECT; }
+sub key_train_pictures { return $KEY_TRAIN_PICTURES; }
+sub key_train_camera   { return $KEY_TRAIN_CAMERA; }
 sub conf_file    { return $CONF_FILE; }
 sub stack_depth   { return $STACK_FRAMES; }
 
 # ---- the two switches ----
 
 sub read_settings {
-    my %on = ($KEY_NIGHT => 0, $KEY_ALL_DAY => 0, $KEY_DETECT => 0);
+    # The picture folder is the sane default for training, so it starts on
+    # rather than off: a brain trained on this camera's own frames is the
+    # point of the harvest, and a conf file written before these two switches
+    # existed should not silently mean "never train".
+    my %on = ($KEY_NIGHT => 0, $KEY_ALL_DAY => 0, $KEY_DETECT => 0,
+              $KEY_TRAIN_PICTURES => 1, $KEY_TRAIN_CAMERA => 0);
     open my $fh, '<', $CONF_FILE or return \%on;
     while (my $line = <$fh>) {
         next if $line =~ /^\s*#/;
@@ -142,14 +172,23 @@ sub write_settings {
     $on->{$KEY_NIGHT}   = $args{night}   ? 1 : 0 if exists $args{night};
     $on->{$KEY_ALL_DAY} = $args{all_day} ? 1 : 0 if exists $args{all_day};
     $on->{$KEY_DETECT}  = $args{detect}  ? 1 : 0 if exists $args{detect};
+    $on->{$KEY_TRAIN_PICTURES} = $args{train_pictures} ? 1 : 0
+        if exists $args{train_pictures};
+    $on->{$KEY_TRAIN_CAMERA}   = $args{train_camera}   ? 1 : 0
+        if exists $args{train_camera};
     open my $fh, '>', $CONF_FILE or return 0;
     print {$fh} "# Written by the webcam settings window. Two switches:\n";
     print {$fh} "#   night image CLAHE and ML auto correct\n";
     print {$fh} "#   24 hour image CLAHE and ML auto correct\n";
     print {$fh} "#   find cars and people and enhance them\n";
+    print {$fh} "# And where the brain trains from:\n";
+    print {$fh} "#   train the brain from the picture folder\n";
+    print {$fh} "#   train the brain direct from the detected webcamera\n";
     print {$fh} "$KEY_NIGHT=$on->{$KEY_NIGHT}\n";
     print {$fh} "$KEY_ALL_DAY=$on->{$KEY_ALL_DAY}\n";
     print {$fh} "$KEY_DETECT=$on->{$KEY_DETECT}\n";
+    print {$fh} "$KEY_TRAIN_PICTURES=$on->{$KEY_TRAIN_PICTURES}\n";
+    print {$fh} "$KEY_TRAIN_CAMERA=$on->{$KEY_TRAIN_CAMERA}\n";
     close $fh or return 0;
     return 1;
 }
@@ -518,6 +557,185 @@ sub self_train {
     my $out = `python3 @{[ shell_quote($trainer) ]} --self-train --quiet 2>&1` || '';
     my @lines = grep { /\S/ } split /\n/, $out;
     return @lines ? $lines[-1] : undef;
+}
+
+# ---- training from a chosen source ----
+#
+# Two ways in, for the two switches. Both end at the same place: the trainer
+# script, with a folder of frames and --force, which is the route the tile has
+# always advertised for training by hand. Neither touches the model directly -
+# a model is TensorFlow's to write and this is the Perl side.
+
+# Train on a folder of stills. Returns (ok, note).
+sub train_from_photos {
+    my ($folder) = @_;
+    my $trainer = trainer_script();
+    return (0, 'train_webcam_brain.py is not here with a python3 to run it')
+        unless length $trainer;
+    return (0, 'no folder to train from')
+        unless defined $folder && length $folder && -d $folder;
+
+    my @shots = grep { -f $_ } (glob("$folder/*.jpg"), glob("$folder/*.jpeg"),
+                                glob("$folder/*.png"));
+    return (0, "no pictures in $folder yet - the light meter fills it as it runs")
+        unless @shots;
+
+    my $out = `python3 @{[ shell_quote($trainer) ]} --photos @{[ shell_quote($folder) ]} --force 2>&1` || '';
+    my @lines = grep { /\S/ } split /\n/, $out;
+    my $note = @lines ? $lines[-1] : 'the trainer said nothing';
+    return (($? == 0 ? 1 : 0), scalar(@shots) . " pictures: $note");
+}
+
+# The shell command that trains from a folder, for a caller that wants to run
+# it as a child process and watch the log rather than block on it. Training
+# takes a minute or two and a minute or two inside an event loop is a frozen
+# window.
+sub train_from_photos_command {
+    my ($folder) = @_;
+    my $trainer = trainer_script();
+    return '' unless length $trainer;
+    return '' unless defined $folder && length $folder;
+    return 'python3 ' . shell_quote($trainer)
+         . ' --photos ' . shell_quote($folder) . ' --force';
+}
+
+# ---- training direct from the camera ----
+
+# Where a burst off the camera is put. Its own folder, not the picture folder:
+# the light meter measures the newest still in there and a burst of twelve
+# would have it measuring frames nobody asked for.
+sub camera_training_dir {
+    my $dir = $ENV{WEBCAM_CAMERA_TRAINING_DIR}
+           || home_dir() . '/Pictures/webcam-camera-training';
+    return make_dir_path($dir) ? $dir : undef;
+}
+
+# Who holds the camera, if anyone - the same question the window asks before
+# grabbing a snapshot, asked again here because the scheduler and the Python
+# side call this too and neither goes through the window.
+#
+# This is the whole difficulty with training direct from the camera. A V4L2
+# device lets one program stream at a time, and on a machine that is recording
+# the recorder has it. Worse than failing would be succeeding at the wrong
+# moment: if the recorder drops and re-opens its stream just as a grab lands,
+# the grab wins and the recorder does not come back. So when anything else
+# holds the device, nothing is sent to it.
+sub camera_holder {
+    my ($dev) = @_;
+    return undef unless defined $dev && -e $dev;
+
+    if (system('command -v fuser >/dev/null 2>&1') == 0) {
+        my $out = `fuser -v $dev 2>&1` || '';
+        my %names;
+        for my $line (split /\n/, $out) {
+            next unless $line =~ /^\s*\S*\s+(\d+)\s+\S+\s+(\S+)\s*$/;
+            my ($pid, $name) = ($1, $2);
+            next if $pid == $$;
+            $names{"$name (pid $pid)"} = 1;
+        }
+        return join(', ', sort keys %names) if %names;
+    }
+    if (system('command -v lsof >/dev/null 2>&1') == 0) {
+        my $out = `lsof -F cp $dev 2>/dev/null` || '';
+        my ($pid, %names);
+        for my $line (split /\n/, $out) {
+            $pid = $1 if $line =~ /^p(\d+)/;
+            if ($line =~ /^c(\S+)/ && defined $pid && $pid != $$) {
+                $names{"$1 (pid $pid)"} = 1;
+            }
+        }
+        return join(', ', sort keys %names) if %names;
+    }
+    return undef;
+}
+
+# Grab a short burst off the camera into the training folder.
+# Returns (count, folder, note).
+sub capture_training_burst {
+    my ($dev, $frames) = @_;
+    $dev    = '/dev/video0' unless defined $dev && length $dev;
+    $frames = $BURST_FRAMES unless defined $frames && $frames > 0;
+
+    return (0, undef, "$dev does not exist - is the camera plugged in?")
+        unless -e $dev;
+    return (0, undef, 'ffmpeg is not installed, so no frames can be grabbed')
+        unless system('command -v ffmpeg >/dev/null 2>&1') == 0;
+
+    my $holder = camera_holder($dev);
+    return (0, undef, "$holder has $dev, so the camera cannot be grabbed from "
+                    . 'while that is running - training from the picture folder '
+                    . 'instead is the way round it')
+        if defined $holder;
+
+    my $dir = camera_training_dir();
+    return (0, undef, 'nowhere to put the frames') unless defined $dir;
+
+    # Everything from a previous burst goes first. A burst is a set of frames
+    # of one scene in one light, and mixing tonight's with last week's is how a
+    # training folder quietly becomes a folder of two different places.
+    unlink $_ for grep { -f $_ } glob("$dir/*.jpg");
+
+    my @t = localtime();
+    my $stamp = sprintf('%04d%02d%02d-%02d%02d%02d',
+        $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+
+    my $got = 0;
+    for my $n (1 .. $frames) {
+        my $path = sprintf('%s/camera-%s-%02d.jpg', $dir, $stamp, $n);
+        my $rc = system("ffmpeg -nostdin -loglevel error -f v4l2 -i $dev"
+                      . " -frames:v 1 -q:v 2 -y '$path' 2>/dev/null");
+        if ($rc == 0 && -s $path) {
+            $got++;
+        } else {
+            unlink $path if -e $path;
+            # The first frame failing is the camera refusing; the fifth failing
+            # is a hiccup. Only the first is worth stopping for.
+            last if $n == 1;
+        }
+        select(undef, undef, undef, $BURST_SPACING) if $n < $frames;
+    }
+
+    return (0, $dir, "ffmpeg could not grab a frame from $dev - another program "
+                   . 'may have taken it, or this user may not be in the video group')
+        unless $got;
+    return ($got, $dir, "grabbed $got frames from $dev");
+}
+
+# Grab a burst and train on it. Returns (ok, note).
+sub train_from_camera {
+    my ($dev) = @_;
+    my ($got, $dir, $note) = capture_training_burst($dev);
+    return (0, $note) unless $got;
+    my ($ok, $trained) = train_from_photos($dir);
+    return ($ok, "$note; $trained");
+}
+
+# Which sources the switches have selected, as a list of (label, folder) pairs
+# ready to train from. The camera one grabs its burst here, so a caller gets
+# back only folders that actually have frames in them.
+sub training_sources {
+    my (%args) = @_;
+    my $on = read_settings();
+    my @sources;
+    my @notes;
+
+    if ($on->{$KEY_TRAIN_CAMERA}) {
+        my ($got, $dir, $note) = capture_training_burst($args{device});
+        push @notes, $note;
+        push @sources, [ 'the camera', $dir ] if $got && defined $dir;
+    }
+    if ($on->{$KEY_TRAIN_PICTURES}) {
+        my $dir = $args{folder};
+        if (defined $dir && -d $dir) {
+            push @sources, [ 'the picture folder', $dir ];
+        } else {
+            push @notes, 'no picture folder to train from';
+        }
+    }
+    unless ($on->{$KEY_TRAIN_CAMERA} || $on->{$KEY_TRAIN_PICTURES}) {
+        push @notes, 'both training switches are off, so the brain is not being trained';
+    }
+    return (\@sources, join('; ', @notes));
 }
 
 # What has been harvested, as the index the Python side keeps.
