@@ -37,6 +37,12 @@ BEGIN {
             DateTime::Duration
             DateTime::Event::Sunrise
         ));
+        # The python side too - this is the program that actually runs the
+        # correction, so OpenCV and TensorFlow being installed matters here
+        # more than anywhere. Every step is printed; under cron there is no
+        # terminal to ask on, so it prints the plan and carries on unless
+        # WEBCAM_AUTO_INSTALL=1 says to go ahead.
+        WebcamBootstrap::ensure_python_stack();
         last;
     }
 }

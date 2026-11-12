@@ -182,4 +182,58 @@ sub _unique {
     return grep { !$seen{$_}++ } @_;
 }
 
+# ---- the python side of the dependencies, printed step by step ----
+#
+# Everything above is about perl: Tk, and the apt packages that provide the
+# command-line tools. The correction itself is python - OpenCV for the
+# stacking, the CLAHE and the detector, TensorFlow for brain G - and those are
+# the two that actually break, so they are installed by webcam_install.py,
+# which knows about conda and pip and prints every step as it goes.
+#
+# Its output is streamed straight through to this terminal rather than
+# captured, because a pip resolving TensorFlow is quiet for a long time and a
+# captured install looks exactly like a hung one. It never exits non-zero in a
+# way that stops us: a window that will not open because an optional
+# dependency is missing is worse than one that opens and says so in the tile.
+sub ensure_python_stack {
+    return if $ENV{WEBCAM_NO_BOOTSTRAP};
+
+    my $helper = '';
+    my @where = ('.');
+    if ($0 =~ m{^(.*)/[^/]+$}) { unshift @where, $1; }
+    push @where, "$ENV{HOME}/Pictures/webcam" if $ENV{HOME};
+    for my $dir (@where) {
+        next unless defined $dir && length $dir;
+        if (-f "$dir/webcam_install.py") { $helper = "$dir/webcam_install.py"; last; }
+    }
+    unless (length $helper) {
+        print "webcam: webcam_install.py is not here, so the python "
+            . "dependencies are not being checked\n";
+        return;
+    }
+    if (system('command -v python3 >/dev/null 2>&1') != 0) {
+        print "webcam: no python3, so OpenCV, TensorFlow and the detector "
+            . "cannot be installed or used\n";
+        print "  to add it: apt-get -y install python3\n";
+        return;
+    }
+
+    print "webcam: checking the python side - OpenCV, TensorFlow, numpy, "
+        . "astral\n";
+    my $quoted = $helper;
+    $quoted =~ s/(['\\])/\\$1/g;
+    # Line by line, with the helper's own output passed through unchanged so
+    # that the two windows print the same words for the same situation.
+    if (open my $pipe, '-|', "python3 '$quoted' 2>&1") {
+        while (my $line = <$pipe>) {
+            print $line;
+        }
+        close $pipe;
+    } else {
+        print "webcam: could not run the python dependency check: $!\n";
+    }
+    print "\n";
+    return 1;
+}
+
 1;

@@ -29,6 +29,11 @@ BEGIN {
         unshift @INC, $dir;
         require WebcamBootstrap;
         WebcamBootstrap::ensure(qw(Tk));
+        # Then the python side - OpenCV, TensorFlow, numpy, astral - with
+        # every step printed as it happens. Before the window opens, because
+        # whether OpenCV imported decides what the tile at the bottom of it
+        # has to show.
+        WebcamBootstrap::ensure_python_stack();
         last;
     }
 }
@@ -1643,6 +1648,547 @@ sub refresh_brain_tile {
     return 1;
 }
 
+# ---- Working status, the error log, and the before/after pictures ----
+#
+# Three things that all answer the same question - "is the correction actually
+# working?" - and that the picture alone cannot answer.
+#
+# A trained model and an ONNX detector fail quietly by design: every handler in
+# the correction path is written so that a failure costs the frame rather than
+# the schedule, which is right at three in the morning and useless when the
+# pictures come out wrong and nothing says why. So:
+#
+#   1. whether OpenCV and TensorFlow are *working*, which is a different
+#      question from whether they are installed - an import that succeeds and
+#      then throws on the first real call is how a mixed conda and pip install
+#      fails, so the helper does one small real piece of work with each;
+#   2. every failure, in full, with its traceback, tailed out of the log that
+#      webcam_errors.py writes from both this window and the scheduler;
+#   3. the four frames, two rows of two: the correction on the top row, and
+#      what the detector then picked out of it underneath, with the box drawn
+#      on - green for a person, blue for a car.
+#
+# The status and the thumbnails both come from webcam_status.py, run as a
+# child process rather than parsed in here: it is the same helper the python
+# window imports directly, so the two windows cannot drift into disagreeing
+# about what is working. It prints pipe-separated lines for this one, which
+# needs no JSON module on top of Tk.
+my %status_tile;
+
+# How often the error log is re-read, and how much of it is kept on screen.
+my $ERROR_POLL  = 1500;      # ms
+my $ERROR_LINES = 400;
+my $COMPARE_POLL = 30_000;   # ms - the scheduler corrects a frame every few
+
+# The colour each stage's failures are marked in, so that a wall of traceback
+# can still be read at a glance.
+my %STAGE_COLOUR = (
+    'OpenCV'     => '#ff6b6b',
+    'TensorFlow' => '#ff9b4a',
+    'brain G'    => '#ffd24a',
+    'detector'   => '#7ec8ff',
+    'CLAHE'      => '#b9a0ff',
+    'stacking'   => '#b9a0ff',
+    'denoise'    => '#b9a0ff',
+    'install'    => '#9fe6a0',
+);
+
+# A helper that sits beside this script. The search order is the one
+# WebcamEnhance::python_helper uses, so a copy run out of a different
+# directory finds the same files the rest of the program does.
+sub helper_beside {
+    my ($name) = @_;
+    my @where = ('.', $ENV{HOME} ? "$ENV{HOME}/Pictures/webcam" : ());
+    if ($0 =~ m{^(.*)/[^/]+$}) { unshift @where, $1; }
+    for my $dir (@where) {
+        next unless defined $dir && length $dir;
+        return "$dir/$name" if -f "$dir/$name";
+    }
+    return '';
+}
+
+sub build_status_tile {
+    my ($parent) = @_;
+
+    my $frame = $parent->Frame(-borderwidth => 1, -relief => 'sunken');
+    $frame->pack(-side => 'top', -fill => 'x', -padx => 4, -pady => 3);
+    $status_tile{frame} = $frame;
+    $status_tile{mw} = $parent->toplevel;
+
+    my $bar = $frame->Frame->pack(-fill => 'x');
+    $bar->Label(-text => 'is it working - OpenCV, TensorFlow, the detector',
+                -font => 'Helvetica 9 bold')->pack(-side => 'left', -padx => 4);
+    $status_tile{summary} = $bar->Label(-text => 'checking...',
+        -font => 'Helvetica 8', -fg => '#036', -anchor => 'w');
+    $status_tile{summary}->pack(-side => 'left', -padx => 4);
+    $bar->Button(-text => 'Re-check', -font => 'Helvetica 8',
+                 -command => \&refresh_status_tile)
+        ->pack(-side => 'right', -padx => 2);
+
+    # One row per library. Built empty and filled by the helper's answer, so
+    # that a library this window has never heard of still gets a row.
+    my $rows = $frame->Frame->pack(-fill => 'x', -padx => 6, -pady => 2);
+    $status_tile{rows} = $rows;
+    $status_tile{row_widgets} = {};
+
+    # ---- the four pictures, two rows of two ----
+    #
+    # Written as binary PPM by the helper, which Tk::Photo reads with nothing
+    # extra installed - no Tk::PNG and no Tk::JPEG, which on a window that
+    # installs its own dependencies is one less thing to go wrong.
+    # A plain Frame with a bold Label for a heading, the way brain G's tile
+    # above does it. Not a LabFrame: it is a separate widget class that has to
+    # be loaded, and this window installs its own dependencies - one more
+    # module to be missing buys nothing but a border.
+    my $pics = $frame->Frame(-borderwidth => 1, -relief => 'groove');
+    $pics->pack(-fill => 'x', -padx => 4, -pady => 3);
+    $pics->Label(-text => 'before and after - top row the correction, '
+                        . 'bottom row what was found in it',
+                 -font => 'Helvetica 8 bold', -anchor => 'w')
+        ->pack(-fill => 'x', -padx => 4);
+    $status_tile{pics} = $pics;
+
+    $status_tile{note} = $pics->Label(-text => 'no corrected frames yet',
+        -font => 'Helvetica 8', -fg => '#666', -anchor => 'w',
+        -justify => 'left');
+    $status_tile{note}->pack(-fill => 'x', -padx => 4);
+
+    $status_tile{photo} = {};        # name -> Tk::Photo, held against GC
+    $status_tile{image_label} = {};
+    $status_tile{caption} = {};
+
+    # Two rows; left and right in each. The order matches the helper's STAGES.
+    my @order = ('raw.ppm', 'corrected.ppm', 'boost-before.ppm',
+                 'boost-after.ppm');
+    for my $row (0, 1) {
+        my $line = $pics->Frame->pack(-fill => 'x', -padx => 2, -pady => 2);
+        for my $column (0, 1) {
+            my $name = $order[$row * 2 + $column];
+            my $cell = $line->Frame->pack(-side => 'left', -fill => 'both',
+                                          -expand => 1, -padx => 3);
+            $status_tile{caption}{$name} = $cell->Label(
+                -text => '', -font => 'Helvetica 8', -fg => '#036',
+                -anchor => 'w');
+            $status_tile{caption}{$name}->pack(-fill => 'x');
+            $status_tile{image_label}{$name} = $cell->Label(
+                -text => '(not written yet)', -font => 'Helvetica 8',
+                -fg => '#888', -borderwidth => 1, -relief => 'flat',
+                -background => '#101010');
+            $status_tile{image_label}{$name}->pack(-fill => 'both',
+                                                   -expand => 1);
+        }
+    }
+
+    # The legend, which is the only place the rectangle colours are written
+    # down for a person rather than for OpenCV.
+    my $legend = $pics->Frame->pack(-fill => 'x', -padx => 4, -pady => 2);
+    $legend->Label(-text => 'rectangles:', -font => 'Helvetica 8')
+        ->pack(-side => 'left');
+    $legend->Label(-text => ' person ', -font => 'Helvetica 8 bold',
+                   -background => '#5adc5a', -foreground => 'black')
+        ->pack(-side => 'left', -padx => 2);
+    $legend->Label(-text => ' car / vehicle ', -font => 'Helvetica 8 bold',
+                   -background => '#5ab4fa', -foreground => 'black')
+        ->pack(-side => 'left', -padx => 2);
+    $legend->Label(-text => 'drawn on the bottom-right frame only - the '
+                 . 'corrected still that is kept has no boxes on it',
+                   -font => 'Helvetica 8', -fg => '#666')
+        ->pack(-side => 'left', -padx => 6);
+
+    # ---- the error log, in a terminal of its own ----
+    my $errors = $frame->Frame(-borderwidth => 1, -relief => 'groove');
+    $errors->pack(-fill => 'both', -expand => 1, -padx => 4, -pady => 3);
+    $errors->Label(-text => 'every OpenCV, TensorFlow, brain G and '
+                          . 'correction error, in full',
+                   -font => 'Helvetica 8 bold', -anchor => 'w')
+        ->pack(-fill => 'x', -padx => 4);
+
+    my $ebar = $errors->Frame->pack(-fill => 'x');
+    $status_tile{error_count} = $ebar->Label(-text => 'reading the log...',
+        -font => 'Helvetica 8', -fg => '#036', -anchor => 'w');
+    $status_tile{error_count}->pack(-side => 'left', -padx => 4);
+    $ebar->Button(-text => 'Clear log', -font => 'Helvetica 8',
+                  -command => \&clear_error_log)->pack(-side => 'right',
+                                                       -padx => 2);
+    $ebar->Button(-text => 'Reload', -font => 'Helvetica 8',
+                  -command => sub { load_error_log(1) })
+        ->pack(-side => 'right', -padx => 2);
+
+    my $ebody = $errors->Frame->pack(-fill => 'both', -expand => 1);
+    my $etext = $ebody->Text(
+        -width => $TERM_COLS, -height => 12, -wrap => 'none',
+        -font => 'Courier 9', -background => '#101010',
+        -foreground => '#d0d0d0', -insertbackground => '#d0d0d0',
+        -highlightthickness => 0, -state => 'disabled');
+    my $escroll = $ebody->Scrollbar(-orient => 'vertical',
+        -command => [ 'yview', $etext ], -width => 16);
+    $etext->configure(-yscrollcommand => [ 'set', $escroll ]);
+    $etext->pack(-side => 'left', -fill => 'both', -expand => 1);
+    $escroll->pack(-side => 'right', -fill => 'y');
+    $status_tile{error_text} = $etext;
+
+    # One tag per stage, so the failures can be told apart by colour.
+    for my $stage (keys %STAGE_COLOUR) {
+        $etext->tagConfigure("stage-$stage",
+                             -foreground => $STAGE_COLOUR{$stage});
+    }
+    $etext->tagConfigure('trace', -foreground => '#8a8a8a');
+    $etext->tagConfigure('hint', -foreground => '#9fe6a0');
+
+    # The wheel bindings on the toplevel would scroll the controls behind
+    # this, the same way they would over the scheduler's terminal.
+    $etext->bind('<Button-4>',
+                 sub { $etext->yview('scroll', -3, 'units'); Tk->break });
+    $etext->bind('<Button-5>',
+                 sub { $etext->yview('scroll',  3, 'units'); Tk->break });
+
+    refresh_status_tile();
+    load_error_log(1);
+    $status_tile{mw}->after($ERROR_POLL, \&poll_error_log);
+    $status_tile{mw}->after($COMPARE_POLL, \&poll_compare_frames);
+    return $frame;
+}
+
+# How wide the pair of pictures should be: the width of the terminal above
+# them, so the two rows line up with it and with each other.
+sub compare_width {
+    my $width = 0;
+    $width = $term{text}->width if $term{text};
+    $width = $TERM_COLS * 8 if !$width || $width < 100;
+    $width = 360  if $width < 360;
+    $width = 1600 if $width > 1600;
+    return int($width);
+}
+
+# Run the helper and read its answer. In a child process with the answer
+# written to a file, polled on a timer - the same arrangement the retraining
+# button uses, and for the same reason: importing TensorFlow takes several
+# seconds and doing it on the main thread would freeze the window.
+sub refresh_status_tile {
+    return if $status_tile{busy};
+    my $helper = helper_beside('webcam_status.py');
+    unless (length $helper) {
+        $status_tile{summary}->configure(
+            -text => 'webcam_status.py is not here beside this script',
+            -fg => '#a00');
+        return;
+    }
+    $status_tile{busy} = 1;
+    $status_tile{summary}->configure(
+        -text => 'checking OpenCV and TensorFlow, this takes a few seconds...',
+        -fg => '#036');
+
+    my $out = '/tmp/.webcam-status.txt';
+    unlink $out;
+    $status_tile{out} = $out;
+    my $width = compare_width();
+    my $quoted = $helper;
+    $quoted =~ s/(['\\])/\\$1/g;
+    my $pid = fork();
+    if (!defined $pid) {
+        $status_tile{busy} = 0;
+        $status_tile{summary}->configure(-text => 'could not start the check',
+                                         -fg => '#a00');
+        return;
+    }
+    if ($pid == 0) {
+        exec("python3 '$quoted' --lines --thumb-width $width >$out 2>/dev/null")
+            || exit 1;
+    }
+    $status_tile{pid} = $pid;
+    $status_tile{mw}->after(500, \&poll_status_tile);
+    return 1;
+}
+
+sub poll_status_tile {
+    return unless $status_tile{busy};
+    my $pid = $status_tile{pid};
+    my $done = $pid ? waitpid($pid, 1) : -1;          # 1 is WNOHANG
+    if ($done == 0) {
+        $status_tile{mw}->after(500, \&poll_status_tile);
+        return;
+    }
+    $status_tile{busy} = 0;
+    $status_tile{pid} = undef;
+
+    my @lines;
+    if (open my $fh, '<', ($status_tile{out} || '')) {
+        @lines = <$fh>;
+        close $fh;
+    }
+    unless (@lines) {
+        $status_tile{summary}->configure(
+            -text => 'the check printed nothing - python3 may be missing',
+            -fg => '#a00');
+        return;
+    }
+
+    my (@checks, @thumbs, @notes);
+    for my $line (@lines) {
+        chomp $line;
+        my @field = split /\|/, $line, -1;
+        next unless @field;
+        push @checks, \@field if $field[0] eq 'CHECK';
+        push @thumbs, \@field if $field[0] eq 'THUMB';
+        push @notes, $field[1] if $field[0] eq 'NOTE';
+    }
+    draw_status_rows(\@checks);
+    draw_compare_frames(\@thumbs, join("\n", @notes));
+    return 1;
+}
+
+sub draw_status_rows {
+    my ($checks) = @_;
+    my $rows = $status_tile{rows} or return;
+    my ($good, $bad) = (0, 0);
+
+    for my $check (@$checks) {
+        my (undef, $name, $ok, $version, $detail, $hint) = @$check;
+        $ok ? $good++ : $bad++;
+        my $widgets = $status_tile{row_widgets}{$name};
+        unless ($widgets) {
+            my $line = $rows->Frame->pack(-fill => 'x');
+            $widgets = $status_tile{row_widgets}{$name} = {
+                name  => $line->Label(-text => $name, -width => 16,
+                                      -anchor => 'w',
+                                      -font => 'Helvetica 8 bold'),
+                state => $line->Label(-width => 12, -anchor => 'w',
+                                      -font => 'Helvetica 8 bold'),
+                detail => $line->Label(-anchor => 'w', -font => 'Helvetica 8',
+                                       -justify => 'left'),
+            };
+            $widgets->{name}->pack(-side => 'left');
+            $widgets->{state}->pack(-side => 'left');
+            $widgets->{detail}->pack(-side => 'left', -fill => 'x');
+        }
+        $widgets->{state}->configure(
+            -text => $ok ? 'working' : 'NOT working',
+            -fg   => $ok ? '#0a7a2a' : '#a00000');
+        my $text = $detail;
+        $text = "$version - $text" if length $version;
+        $text .= "   try: $hint" if !$ok && length $hint;
+        $widgets->{detail}->configure(-text => $text,
+                                      -fg => $ok ? '#333' : '#a00000');
+    }
+
+    if ($bad) {
+        $status_tile{summary}->configure(
+            -text => "$good working, $bad not - the rows below say which",
+            -fg => '#a00000');
+    } else {
+        $status_tile{summary}->configure(
+            -text => "all $good working", -fg => '#0a7a2a');
+    }
+    return 1;
+}
+
+sub draw_compare_frames {
+    my ($thumbs, $note) = @_;
+    my $shown = 0;
+
+    for my $thumb (@$thumbs) {
+        my (undef, $name, $caption, $path, $width, $height) = @$thumb;
+        my $label = $status_tile{image_label}{$name} or next;
+        $status_tile{caption}{$name}->configure(-text => $caption);
+
+        unless (length $path && -f $path) {
+            $label->configure(-image => undef, -text => '(not written yet)',
+                              -fg => '#888');
+            delete $status_tile{photo}{$name};
+            next;
+        }
+        # A new Photo each time rather than a reload: Tk caches by filename
+        # and the helper writes a new name for each width, so reusing one
+        # would show the old size after the window is resized.
+        my $photo = eval { $status_tile{mw}->Photo(-file => $path,
+                                                   -format => 'ppm') };
+        unless ($photo) {
+            my $why = $@ || 'unreadable';
+            $why =~ s/\s+at\s+\S+\s+line\s+\d+.*//s;
+            $label->configure(-image => undef,
+                              -text => "(could not read it: $why)",
+                              -fg => '#a00');
+            next;
+        }
+        # The old Photo is freed only once nothing points at it, so the
+        # replacement goes in first and the delete happens by overwriting.
+        $status_tile{photo}{$name} = $photo;
+        $label->configure(-image => $photo, -text => '');
+        $shown++;
+    }
+
+    if ($shown) {
+        $status_tile{note}->configure(
+            -text => (length $note ? $note : "$shown of 4 frames shown"),
+            -fg => '#036');
+    } else {
+        $status_tile{note}->configure(
+            -text => 'no comparison frames yet - they are written the next '
+                   . 'time a snapshot is corrected',
+            -fg => '#666');
+    }
+    return $shown;
+}
+
+# Pick up a newer set of frames without being asked. Only the file times are
+# looked at, so a quiet night costs nothing.
+sub poll_compare_frames {
+    my $folder = $status_tile{compare_dir};
+    unless (defined $folder) {
+        # Worked out once, from the helper's own idea of where they go.
+        $folder = '';
+        if (open my $fh, '<', ($status_tile{out} || '')) {
+            while (my $line = <$fh>) {
+                if ($line =~ /^DIR\|(.*)$/) { chomp($folder = $1); last; }
+            }
+            close $fh;
+        }
+        $status_tile{compare_dir} = $folder;
+    }
+    if (length $folder) {
+        my $newest = 0;
+        for my $name (qw(raw corrected boost-before boost-after)) {
+            my $path = "$folder/$name.jpg";
+            next unless -f $path;
+            my $when = (stat $path)[9] || 0;
+            $newest = $when if $when > $newest;
+        }
+        if ($newest && $newest > ($status_tile{compare_seen} || 0)) {
+            $status_tile{compare_seen} = $newest;
+            refresh_status_tile();
+        }
+    }
+    $status_tile{mw}->after($COMPARE_POLL, \&poll_compare_frames);
+    return 1;
+}
+
+# ---- the error log ----
+#
+# webcam_errors.py appends to one file from every process in the program -
+# this window, the scheduler, the light meter and the retraining - so tailing
+# it here shows failures from all of them in the order they happened.
+sub error_log_file {
+    return $status_tile{error_file} if defined $status_tile{error_file};
+    $status_tile{error_file} = $ENV{WEBCAM_ERROR_LOG}
+        || ($ENV{HOME} ? "$ENV{HOME}/Pictures/webcam/webcam-errors.log" : '');
+    return $status_tile{error_file};
+}
+
+sub load_error_log {
+    my ($whole) = @_;
+    my $text = $status_tile{error_text} or return;
+    my $path = error_log_file();
+    unless (length $path && -f $path) {
+        $status_tile{error_count}->configure(
+            -text => 'nothing logged yet - no failures so far', -fg => '#0a7a2a');
+        return;
+    }
+    my @lines;
+    if (open my $fh, '<', $path) {
+        @lines = <$fh>;
+        close $fh;
+    }
+    @lines = @lines[-$ERROR_LINES .. -1] if @lines > $ERROR_LINES;
+
+    $text->configure(-state => 'normal');
+    $text->delete('1.0', 'end');
+    my $failures = 0;
+    for my $line (@lines) {
+        $failures++ if $line =~ /FAILED:/;
+        append_error_line($text, $line);
+    }
+    $text->configure(-state => 'disabled');
+    $text->see('end');
+    $status_tile{error_size} = -s $path;
+    $status_tile{error_count}->configure(
+        -text => $failures ? "$failures failure(s) in the log"
+                           : 'no failures in the log',
+        -fg => $failures ? '#a00000' : '#0a7a2a');
+    return 1;
+}
+
+# One line, with the stage it belongs to picked out in colour. The traceback
+# lines are indented by the writer, which is how they are told apart here.
+sub append_error_line {
+    my ($text, $line) = @_;
+    my $tag = '';
+    if ($line =~ /\]\s+(.+?)\s+FAILED:/) {
+        my $stage = $1;
+        for my $known (keys %STAGE_COLOUR) {
+            if (index(lc $stage, lc $known) >= 0) { $tag = "stage-$known"; last; }
+        }
+        $tag ||= 'stage-OpenCV';
+    } elsif ($line =~ /^\s+try:/) {
+        $tag = 'hint';
+    } elsif ($line =~ /^\s{4}/) {
+        $tag = 'trace';
+    }
+    $text->insert('end', $line, ($tag ? $tag : ()));
+    return 1;
+}
+
+# Only what has been added since the last look, so that a log being written
+# to every few seconds does not redraw the whole pane each time.
+sub poll_error_log {
+    my $text = $status_tile{error_text};
+    unless ($text) {
+        return;
+    }
+    my $path = error_log_file();
+    if (length $path && -f $path) {
+        my $size = -s $path;
+        my $seen = $status_tile{error_size} || 0;
+        if ($size < $seen) {
+            load_error_log(1);                # rolled or cleared under us
+        } elsif ($size > $seen) {
+            if (open my $fh, '<', $path) {
+                seek $fh, $seen, 0;
+                my @fresh = <$fh>;
+                close $fh;
+                $status_tile{error_size} = $size;
+                $text->configure(-state => 'normal');
+                my $added = 0;
+                for my $line (@fresh) {
+                    $added++ if $line =~ /FAILED:/;
+                    append_error_line($text, $line);
+                }
+                # Keep the pane bounded the way the scheduler's terminal is.
+                my $count = $text->index('end - 1 line');
+                $count =~ s/\..*//;
+                $text->delete('1.0', ($count - $ERROR_LINES) . '.0')
+                    if $count > $ERROR_LINES;
+                $text->configure(-state => 'disabled');
+                $text->see('end');
+                if ($added) {
+                    $status_tile{error_total} =
+                        ($status_tile{error_total} || 0) + $added;
+                    $status_tile{error_count}->configure(
+                        -text => "$status_tile{error_total} new failure(s) "
+                               . 'since this window opened', -fg => '#a00000');
+                }
+            }
+        }
+    }
+    $status_tile{mw}->after($ERROR_POLL, \&poll_error_log);
+    return 1;
+}
+
+sub clear_error_log {
+    my $helper = helper_beside('webcam_errors.py');
+    if (length $helper) {
+        my $quoted = $helper;
+        $quoted =~ s/(['\\])/\\$1/g;
+        system("python3 '$quoted' --clear >/dev/null 2>&1");
+    } else {
+        my $path = error_log_file();
+        if (length $path && open my $fh, '>', $path) { close $fh; }
+    }
+    $status_tile{error_size} = 0;
+    $status_tile{error_total} = 0;
+    load_error_log(1);
+    return 1;
+}
+
 sub build_terminal {
     my ($mw, $filename, $side) = @_;
     $side ||= 'bottom';
@@ -1769,6 +2315,11 @@ my $c2 = $cols->Frame->pack(-side => 'left', -anchor => 'n', -padx => 6);
 # scrolling flow instead of pinning them to the bottom edge.
 build_terminal($page, $TERM_SCRIPT, 'top');
 build_brain_tile($page);
+# Then, under brain G's tile: whether OpenCV and TensorFlow are working, the
+# four before-and-after frames, and every error in full. Last on the page
+# because it is the tallest of the three and the one read when something has
+# already gone wrong.
+build_status_tile($page);
 my ($r1, $r2) = (0, 0);
 
 # ---- Column one: a control for everything the camera reported ----
