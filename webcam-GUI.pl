@@ -1664,9 +1664,11 @@ sub refresh_brain_tile {
 #      fails, so the helper does one small real piece of work with each;
 #   2. every failure, in full, with its traceback, tailed out of the log that
 #      webcam_errors.py writes from both this window and the scheduler;
-#   3. the four frames, two rows of two: the correction on the top row, and
-#      what the detector then picked out of it underneath, with the box drawn
-#      on - green for a person, blue for a car.
+#   3. the six frames, two wide and three tall: the correction on the top
+#      row, what the detector then picked out of it on the middle row with
+#      the box drawn on - green for a person, blue for a car - and on the
+#      bottom row the close crop of what it found, before and after its own
+#      lift, which is the row that says whether the plate can be read.
 #
 # The status and the thumbnails both come from webcam_status.py, run as a
 # child process rather than parsed in here: it is the same helper the python
@@ -1678,7 +1680,13 @@ my %status_tile;
 # How often the error log is re-read, and how much of it is kept on screen.
 my $ERROR_POLL  = 1500;      # ms
 my $ERROR_LINES = 400;
-my $COMPARE_POLL = 30_000;   # ms - the scheduler corrects a frame every few
+# How often the comparison frames are checked for a newer set, and how often
+# they are reloaded regardless. The check is six stats and nothing else, so it
+# can be frequent; the reload runs the helper and reads six pictures, so it
+# should not be. A set written between two polls is on screen within
+# $COMPARE_POLL rather than waiting out a fixed half minute.
+my $COMPARE_POLL  = 3_000;    # ms - look at the file times this often
+my $COMPARE_FORCE = 30_000;   # ms - reload anyway after this long
 
 # The colour each stage's failures are marked in, so that a wall of traceback
 # can still be read at a glance.
@@ -1757,10 +1765,15 @@ sub build_status_tile {
     $status_tile{image_label} = {};
     $status_tile{caption} = {};
 
-    # Two rows; left and right in each. The order matches the helper's STAGES.
-    my @order = ('raw.ppm', 'corrected.ppm', 'boost-before.ppm',
-                 'boost-after.ppm');
-    for my $row (0, 1) {
+    # Two wide and three tall. The order matches the helper's STAGES: the
+    # correction on the top row, what the detector did on the middle row,
+    # and on the bottom row the close crop of whatever was found - which is
+    # the row that answers whether the number plate or the face can actually
+    # be read. The two above it only show that the correction ran.
+    my @order = ('raw.ppm', 'corrected.ppm',
+                 'boost-before.ppm', 'boost-after.ppm',
+                 'crop-before.ppm', 'crop-after.ppm');
+    for my $row (0, 1, 2) {
         my $line = $pics->Frame->pack(-fill => 'x', -padx => 2, -pady => 2);
         for my $column (0, 1) {
             my $name = $order[$row * 2 + $column];
@@ -1770,8 +1783,12 @@ sub build_status_tile {
                 -text => '', -font => 'Helvetica 8', -fg => '#036',
                 -anchor => 'w');
             $status_tile{caption}{$name}->pack(-fill => 'x');
+            # The crop pair is only written when something was found, so an
+            # empty one is an ordinary quiet night rather than a failure.
+            my $blank = $name =~ /^crop-/ ? '(nothing found to crop yet)'
+                                          : '(not written yet)';
             $status_tile{image_label}{$name} = $cell->Label(
-                -text => '(not written yet)', -font => 'Helvetica 8',
+                -text => $blank, -font => 'Helvetica 8',
                 -fg => '#888', -borderwidth => 1, -relief => 'flat',
                 -background => '#101010');
             $status_tile{image_label}{$name}->pack(-fill => 'both',
@@ -1865,6 +1882,7 @@ sub compare_width {
 # button uses, and for the same reason: importing TensorFlow takes several
 # seconds and doing it on the main thread would freeze the window.
 sub refresh_status_tile {
+    my ($frames_only) = @_;
     return if $status_tile{busy};
     my $helper = helper_beside('webcam_status.py');
     unless (length $helper) {
@@ -1874,8 +1892,16 @@ sub refresh_status_tile {
         return;
     }
     $status_tile{busy} = 1;
+    # A frames-only refresh skips the TensorFlow import, which is the slow
+    # part by far - several seconds every time. The pictures change every few
+    # minutes all night and the libraries do not change at all, so re-running
+    # that check for a new picture would be seconds of work to confirm
+    # something that cannot have moved.
+    $status_tile{quick} = $frames_only ? 1 : 0;
     $status_tile{summary}->configure(
-        -text => 'checking OpenCV and TensorFlow, this takes a few seconds...',
+        -text => $frames_only ? 'loading the new frames...'
+                              : 'checking OpenCV and TensorFlow, this takes '
+                              . 'a few seconds...',
         -fg => '#036');
 
     my $out = '/tmp/.webcam-status.txt';
@@ -1892,8 +1918,9 @@ sub refresh_status_tile {
         return;
     }
     if ($pid == 0) {
-        exec("python3 '$quoted' --lines --thumb-width $width >$out 2>/dev/null")
-            || exit 1;
+        my $quick = $frames_only ? ' --quick' : '';
+        exec("python3 '$quoted' --lines$quick --thumb-width $width "
+             . ">$out 2>/dev/null") || exit 1;
     }
     $status_tile{pid} = $pid;
     $status_tile{mw}->after(500, \&poll_status_tile);
@@ -1932,8 +1959,11 @@ sub poll_status_tile {
         push @thumbs, \@field if $field[0] eq 'THUMB';
         push @notes, $field[1] if $field[0] eq 'NOTE';
     }
-    draw_status_rows(\@checks);
+    draw_status_rows(\@checks) unless $status_tile{quick};
     draw_compare_frames(\@thumbs, join("\n", @notes));
+    $status_tile{summary}->configure(-text => $status_tile{summary_text},
+                                     -fg => $status_tile{summary_fg})
+        if $status_tile{quick} && $status_tile{summary_text};
     return 1;
 }
 
@@ -1971,14 +2001,15 @@ sub draw_status_rows {
                                       -fg => $ok ? '#333' : '#a00000');
     }
 
-    if ($bad) {
-        $status_tile{summary}->configure(
-            -text => "$good working, $bad not - the rows below say which",
-            -fg => '#a00000');
-    } else {
-        $status_tile{summary}->configure(
-            -text => "all $good working", -fg => '#0a7a2a');
-    }
+    # Kept so that a frames-only refresh, which does not re-run the checks,
+    # can put this line back rather than leaving "loading the new frames..."
+    # on the screen for the rest of the night.
+    $status_tile{summary_text} = $bad
+        ? "$good working, $bad not - the rows below say which"
+        : "all $good working";
+    $status_tile{summary_fg} = $bad ? '#a00000' : '#0a7a2a';
+    $status_tile{summary}->configure(-text => $status_tile{summary_text},
+                                     -fg => $status_tile{summary_fg});
     return 1;
 }
 
@@ -2047,15 +2078,23 @@ sub poll_compare_frames {
     }
     if (length $folder) {
         my $newest = 0;
-        for my $name (qw(raw corrected boost-before boost-after)) {
+        for my $name (qw(raw corrected boost-before boost-after
+                         crop-before crop-after)) {
             my $path = "$folder/$name.jpg";
             next unless -f $path;
             my $when = (stat $path)[9] || 0;
             $newest = $when if $when > $newest;
         }
-        if ($newest && $newest > ($status_tile{compare_seen} || 0)) {
-            $status_tile{compare_seen} = $newest;
-            refresh_status_tile();
+        # Reload when something moved, and in any case once every
+        # $COMPARE_FORCE - which covers a clock that went backwards over a
+        # daylight saving change, and a file written twice inside one second.
+        my $due = (time - ($status_tile{compare_loaded} || 0))
+                  >= $COMPARE_FORCE / 1000;
+        if (($newest && $newest > ($status_tile{compare_seen} || 0)) || $due) {
+            $status_tile{compare_seen} = $newest
+                if $newest > ($status_tile{compare_seen} || 0);
+            $status_tile{compare_loaded} = time;
+            refresh_status_tile(1);
         }
     }
     $status_tile{mw}->after($COMPARE_POLL, \&poll_compare_frames);
