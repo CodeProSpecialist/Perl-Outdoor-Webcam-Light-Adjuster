@@ -425,6 +425,102 @@ sub enhance_with_magick {
     return ($out_path, join(', ', @how));
 }
 
+# ---- the harvest: training the brain on THIS camera ----
+#
+# The frames come from this side; the training is TensorFlow, so it happens
+# through train_webcam_brain.py, which ships here beside these scripts. The one
+# rule that cannot be bent: only a well exposed frame can be a training target,
+# because a dark night frame cannot be its own answer sheet. A dark frame is
+# kept only when a well exposed frame of the same scene turns up within a
+# couple of minutes to be its answer - which is what dusk, dawn and a light
+# coming on provide, and why the harvest is wired to every light change.
+
+our $LAST_PRESET_FILE = $ENV{WEBCAM_LAST_PRESET} || home_dir() . '/.webcam-last-preset';
+
+# Record the preset just applied, so every frame harvested from now on is filed
+# under the preset that produced it. Written here and read by the Python side
+# too - one line, because the thing that applies a preset and the thing that
+# harvests are usually two different processes.
+sub note_preset {
+    my ($name) = @_;
+    return 0 unless defined $name && length $name;
+    open my $fh, '>', $LAST_PRESET_FILE or return 0;
+    print {$fh} "$name\n" . time() . "\n";
+    close $fh or return 0;
+    return 1;
+}
+
+sub current_preset {
+    open my $fh, '<', $LAST_PRESET_FILE or return undef;
+    my $name = <$fh>;
+    close $fh;
+    return undef unless defined $name;
+    chomp $name;
+    return length $name ? $name : undef;
+}
+
+# The trainer script, if it is about. Same search order as the enhancer.
+my $TRAINER;
+sub trainer_script {
+    return $TRAINER if defined $TRAINER;
+    $TRAINER = '';
+    return $TRAINER if $ENV{WEBCAM_NO_PYTHON_ENHANCER};
+    my @where = ('.', home_dir());
+    if ($0 =~ m{^(.*)/[^/]+$}) { unshift @where, $1; }
+    for my $dir (@where) {
+        my $path = "$dir/train_webcam_brain.py";
+        next unless -f $path;
+        next unless system('command -v python3 >/dev/null 2>&1') == 0;
+        $TRAINER = $path;
+        last;
+    }
+    return $TRAINER;
+}
+
+sub shell_quote {
+    my ($text) = @_;
+    $text = '' unless defined $text;
+    $text =~ s/'/'\\''/g;
+    return "'$text'";
+}
+
+# File one still into the training set. Returns a note, or nothing.
+sub harvest {
+    my (%args) = @_;
+    my $trainer = trainer_script();
+    return undef unless length $trainer;
+    return undef unless defined $args{frame} && -f $args{frame};
+
+    my @cmd = ('python3', shell_quote($trainer), '--harvest',
+               shell_quote($args{frame}));
+    push @cmd, '--preset', shell_quote($args{preset}) if defined $args{preset};
+    push @cmd, '--gain-fraction', sprintf('%.3f', $args{gain_fraction})
+        if defined $args{gain_fraction};
+    my $out = `@cmd 2>&1` || '';
+    for my $line (split /\n/, $out) {
+        return $line if $line =~ /^(harvested|not harvested):/;
+    }
+    return undef;
+}
+
+# Retrain on this camera if the harvest has enough. Returns a note.
+sub self_train {
+    my $trainer = trainer_script();
+    return undef unless length $trainer;
+    my $out = `python3 @{[ shell_quote($trainer) ]} --self-train --quiet 2>&1` || '';
+    my @lines = grep { /\S/ } split /\n/, $out;
+    return @lines ? $lines[-1] : undef;
+}
+
+# What has been harvested, as the index the Python side keeps.
+sub corpus_state {
+    my $trainer = trainer_script();
+    return undef unless length $trainer;
+    my $out = `python3 @{[ shell_quote($trainer) ]} --corpus-state 2>&1` || '';
+    return undef unless length $out;
+    return $out;
+}
+
 # ---- brain G's details, for the window's tile ----
 #
 # Brain G is the trained night vision brain. It runs through webcam_enhance.py,
@@ -474,6 +570,63 @@ sub brain_meta {
     return ();
 }
 
+# What has been harvested from this camera, and what happens next. The harvest
+# is the part worth watching: it is what makes the brain this camera's rather
+# than a general one, and it is the valuable half - a model can be deleted and
+# retrained from it in a minute, the frames cannot be got back without waiting
+# another day.
+sub brain_harvest_text {
+    my ($meta) = @_;
+    $meta = {} unless ref $meta eq 'HASH';
+
+    my $text = "TRAINING ON THIS CAMERA\n"
+      . "  Every pass files a still into a training set, tagged with the preset\n"
+      . "  and how hard the camera was working, and a preset or light change\n"
+      . "  files one immediately. Once there is a spread across the presets and\n"
+      . "  the day, it retrains on them and deletes the shipped brain. Only\n"
+      . "  well-exposed frames can be training targets: a dark frame cannot be\n"
+      . "  its own answer sheet, so one is kept only when a well-exposed frame of\n"
+      . "  the same scene lands within a couple of minutes to be its answer -\n"
+      . "  dusk, dawn, or a light coming on.\n\n";
+
+    unless (length trainer_script()) {
+        return $text
+          . "  train_webcam_brain.py is not here with a python3 to run it, so\n"
+          . "  nothing is being harvested and the brain cannot retrain itself.\n";
+    }
+
+    $text .= sprintf("  %-22s %s\n", 'trained from',
+        $meta->{trained_from} || 'not trained yet');
+    my $state = corpus_state();
+    if (defined $state) {
+        for my $line (split /\n/, $state) {
+            next unless $line =~ /\S/;
+            $text .= "  $line\n";
+        }
+    } else {
+        $text .= "  could not read the harvest\n";
+    }
+
+    my $against = ref $meta->{against_shipped} eq 'HASH' ? $meta->{against_shipped} : undef;
+    if ($against) {
+        $text .= "\n  Against the shipped brain, on the same held-back frames\n"
+               . "  from this camera:\n";
+        $text .= sprintf("      %-20s %s dB\n", "this camera's brain",
+            $against->{own_psnr_db} // '?');
+        $text .= sprintf("      %-20s %s dB\n", 'the shipped brain',
+            $against->{shipped_psnr_db} // '?');
+        $text .= sprintf("      %-20s %s\n", 'shipped brain',
+            $against->{shipped_deleted}
+                ? 'deleted'
+                : 'KEPT - the new one scored worse, so it was not thrown away; '
+                  . 'it will retrain tomorrow');
+    }
+
+    $text .= "\n  To train it by hand on a folder of clear photos instead:\n"
+           . "    python3 train_webcam_brain.py --photos <that folder> --force\n";
+    return $text;
+}
+
 # (headline, text) for the tile.
 sub brain_info_text {
     my ($dir, $meta) = brain_meta();
@@ -486,8 +639,7 @@ sub brain_info_text {
               . "The analytic correct still runs, so the two switches above still\n"
               . "do something - it works out one gamma for the whole frame from the\n"
               . "frame's own average, rather than a gain for every pixel.\n\n"
-              . "To train the brain (needs python3 and TensorFlow):\n"
-              . "    python3 train_webcam_brain.py --photos <folder of clear photos>\n");
+              . brain_harvest_text({}));
     }
 
     my $headline = length $helper
@@ -600,13 +752,7 @@ sub brain_info_text {
           . "writes to it. To lock it: chmod 444 $dir/model.keras");
     $text .= "\n";
 
-    $text .= "RETRAIN IT ON THIS CAMERA\n"
-      . "  The brain that ships with this was trained on general photographs.\n"
-      . "  One trained on daytime stills from THIS camera knows this lens and\n"
-      . "  this sensor, and does better. Leave the 24 hour switch off, let the\n"
-      . "  picture folder fill through a sunny afternoon, copy those stills\n"
-      . "  somewhere, and run:\n\n"
-      . "    python3 train_webcam_brain.py --photos <that folder> --force\n";
+    $text .= brain_harvest_text($meta);
 
     return ($headline, $text);
 }

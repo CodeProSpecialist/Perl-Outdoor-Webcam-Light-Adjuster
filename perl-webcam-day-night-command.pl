@@ -1346,6 +1346,61 @@ sub meter_enhance {
     return $line;
 }
 
+# How often to file a still into the brain's training set. Every pass would
+# fill the quotas with thirty near-identical frames a minute; two minutes apart
+# gives the light time to have actually changed. A preset or light change
+# overrides this and files one immediately, which is the point of it.
+my $HARVEST_EVERY = 120;
+my $harvest_last  = 0;
+my $harvest_now   = 1;      # file one on the first pass
+our $harvest_note = '';
+our $train_note   = '';
+
+# File this still into the training set, and retrain on it once a day.
+#
+# Deliberately last and wrapped: it reads and writes files and sends nothing to
+# the camera, so it cannot affect the correction loop.
+sub meter_harvest {
+    my ($dev, $frame) = @_;
+    return undef unless enhance_module();
+    my $now = time();
+    return undef if !$harvest_now && $now - $harvest_last < $HARVEST_EVERY;
+    $harvest_now  = 0;
+    $harvest_last = $now;
+
+    my $line;
+    my $ok = eval {
+        $line = WebcamEnhance::harvest(
+            frame         => $frame,
+            preset        => WebcamEnhance::current_preset(),
+            gain_fraction => enhance_gain_fraction($dev),
+        );
+        1;
+    };
+    unless ($ok) {
+        my $why = $@ || 'unknown error';
+        $why =~ s/\s+at\s+\S+\s+line\s+\d+.*//s;
+        $harvest_note = "harvest failed: $why";
+        meter_log($harvest_note);
+        return undef;
+    }
+    $harvest_note = $line if defined $line;
+    meter_log($line) if defined $line && $line =~ /^harvested:/;
+
+    # Retrain on this camera once there is enough, and then once a day. The
+    # trainer returns at once when it is not time, so this costs nothing.
+    my $trained;
+    $ok = eval { $trained = WebcamEnhance::self_train(); 1 };
+    if ($ok && defined $trained) {
+        $train_note = $trained;
+        if ($trained =~ /retrained on this camera/) {
+            meter_log($trained, always => 1);
+            return $trained;
+        }
+    }
+    return undef;
+}
+
 sub meter_measure {
     my ($f) = @_;
     return () unless defined $f;
@@ -1516,7 +1571,12 @@ sub meter_pass {
             system("v4l2-ctl -d $dev --set-ctrl sharpness=$sharp 2>/dev/null") if defined $sharp;
             # A preset just changed the light, so refocus for it as well.
             meter_refocus($dev);
-            meter_log('learnt new baseline: '
+            # A preset or a hand on a slider just changed the light. This is
+        # exactly the moment worth filing: the scene is the same and the
+        # exposure is different, which is how the training set gets this
+        # camera's own before and after instead of a guess at one.
+        $harvest_now = 1;
+        meter_log('learnt new baseline: '
                 . join(' ', map { "$_=$have{$_}" } sort keys %have), always => 1);
             return 'light meter: learnt the current preset as the baseline'
                  . (defined $sharp ? ", sharpness set to $sharp" : '');
@@ -1551,6 +1611,7 @@ sub meter_pass {
     # untouched by it - so it happens here, once the frame is in hand and
     # measured, and whatever it says is added to the status line.
     my $enhanced = meter_enhance($dev, $frame, $mean);
+    my $trained = meter_harvest($dev, $frame);
 
     # Median of the last three keeps a passing pair of headlights from
     # dragging the picture darker for the next minute.
@@ -1602,6 +1663,7 @@ sub meter_pass {
         'light meter: trim %+d, mean %d of target %d, white %.1f%%, black %.0f%% - %s',
         $trim, $m, $mean_target, $hot * 100, $cold * 100, $why);
     $status .= " | $enhanced" if defined $enhanced;
+    $status .= " | $trained" if defined $trained;
     return $status;
 }
 

@@ -796,6 +796,61 @@ sub meter_enhance {
     return $line;
 }
 
+# How often to file a still into the brain's training set. Every pass would
+# fill the quotas with thirty near-identical frames a minute; two minutes apart
+# gives the light time to have actually changed. A preset or light change
+# overrides this and files one immediately, which is the point of it.
+my $HARVEST_EVERY = 120;
+my $harvest_last  = 0;
+my $harvest_now   = 1;      # file one on the first pass
+our $harvest_note = '';
+our $train_note   = '';
+
+# File this still into the training set, and retrain on it once a day.
+#
+# Deliberately last and wrapped: it reads and writes files and sends nothing to
+# the camera, so it cannot affect the correction loop.
+sub meter_harvest {
+    my ($dev, $frame) = @_;
+    return undef unless enhance_module();
+    my $now = time();
+    return undef if !$harvest_now && $now - $harvest_last < $HARVEST_EVERY;
+    $harvest_now  = 0;
+    $harvest_last = $now;
+
+    my $line;
+    my $ok = eval {
+        $line = WebcamEnhance::harvest(
+            frame         => $frame,
+            preset        => WebcamEnhance::current_preset(),
+            gain_fraction => enhance_gain_fraction($dev),
+        );
+        1;
+    };
+    unless ($ok) {
+        my $why = $@ || 'unknown error';
+        $why =~ s/\s+at\s+\S+\s+line\s+\d+.*//s;
+        $harvest_note = "harvest failed: $why";
+        meter_log($harvest_note);
+        return undef;
+    }
+    $harvest_note = $line if defined $line;
+    meter_log($line) if defined $line && $line =~ /^harvested:/;
+
+    # Retrain on this camera once there is enough, and then once a day. The
+    # trainer returns at once when it is not time, so this costs nothing.
+    my $trained;
+    $ok = eval { $trained = WebcamEnhance::self_train(); 1 };
+    if ($ok && defined $trained) {
+        $train_note = $trained;
+        if ($trained =~ /retrained on this camera/) {
+            meter_log($trained, always => 1);
+            return $trained;
+        }
+    }
+    return undef;
+}
+
 sub meter_measure {
     my ($f) = @_;
     return () unless defined $f;
@@ -966,7 +1021,12 @@ sub meter_pass {
             system("v4l2-ctl -d $dev --set-ctrl sharpness=$sharp 2>/dev/null") if defined $sharp;
             # A preset just changed the light, so refocus for it as well.
             meter_refocus($dev);
-            meter_log('learnt new baseline: '
+            # A preset or a hand on a slider just changed the light. This is
+        # exactly the moment worth filing: the scene is the same and the
+        # exposure is different, which is how the training set gets this
+        # camera's own before and after instead of a guess at one.
+        $harvest_now = 1;
+        meter_log('learnt new baseline: '
                 . join(' ', map { "$_=$have{$_}" } sort keys %have), always => 1);
             return 'light meter: learnt the current preset as the baseline'
                  . (defined $sharp ? ", sharpness set to $sharp" : '');
@@ -1001,6 +1061,7 @@ sub meter_pass {
     # untouched by it - so it happens here, once the frame is in hand and
     # measured, and whatever it says is added to the status line.
     my $enhanced = meter_enhance($dev, $frame, $mean);
+    my $trained = meter_harvest($dev, $frame);
 
     # Median of the last three keeps a passing pair of headlights from
     # dragging the picture darker for the next minute.
@@ -1052,6 +1113,7 @@ sub meter_pass {
         'light meter: trim %+d, mean %d of target %d, white %.1f%%, black %.0f%% - %s',
         $trim, $m, $mean_target, $hot * 100, $cold * 100, $why);
     $status .= " | $enhanced" if defined $enhanced;
+    $status .= " | $trained" if defined $trained;
     return $status;
 }
 
@@ -1220,6 +1282,9 @@ sub build_brain_tile {
     my $frame = $parent->Frame(-borderwidth => 1, -relief => 'sunken');
     $frame->pack(-side => 'top', -fill => 'x', -padx => 4, -pady => 3);
     $brain_tile{frame} = $frame;
+    # The window itself is declared further down this file, so the handle is
+    # kept here - the same reason the terminal pane keeps $term{mw}.
+    $brain_tile{mw} = $parent->toplevel;
 
     my $bar = $frame->Frame->pack(-fill => 'x');
     $bar->Label(-text => 'brain G - the night vision brain',
@@ -1231,6 +1296,25 @@ sub build_brain_tile {
     # and this is how the window notices.
     $bar->Button(-text => 'Refresh', -font => 'Helvetica 8',
                  -command => \&refresh_brain_tile)->pack(-side => 'right', -padx => 2);
+
+    # Delete and start again. This is here because a trained model can come out
+    # wrong in a way no score catches - too dark, washed out, strange colour -
+    # and then the brain is what did it and the fix is to throw it away and
+    # train another on what has been harvested since. The harvested frames are
+    # not touched, so nothing is lost that cannot be rebuilt in a minute.
+    my $row = $frame->Frame->pack(-fill => 'x', -padx => 4, -pady => 2);
+    $brain_tile{reset} = $row->Button(
+        -text => 'delete old brain and restart with new brain',
+        -font => 'Helvetica 8',
+        -command => \&on_reset_brain,
+    );
+    $brain_tile{reset}->pack(-side => 'left');
+    $row->Label(
+        -text => 'If image is corrected too dark or incorrectly, delete and '
+               . 'retrain the machine learning model.',
+        -font => 'Helvetica 8', -anchor => 'w', -justify => 'left',
+        -wraplength => 420,
+    )->pack(-side => 'left', -padx => 6);
 
     my $body = $frame->Frame->pack(-fill => 'both', -expand => 1);
     my $text = $body->Text(
@@ -1252,6 +1336,80 @@ sub build_brain_tile {
 
     refresh_brain_tile();
     return $frame;
+}
+
+# Delete the brain and train a new one from the harvest.
+#
+# Training takes a minute or two, and a minute or two of work in the event loop
+# is a frozen window. So it runs as a child process writing to a log, and the
+# log is read on a timer - the same arrangement the terminal pane uses, and for
+# the same reason.
+sub on_reset_brain {
+    return unless enhance_module();
+    return if $brain_tile{busy};
+
+    my $trainer = WebcamEnhance::trainer_script();
+    unless (length $trainer) {
+        $brain_tile{status}->configure(
+            -text => 'train_webcam_brain.py is not here with a python3 to run it');
+        return;
+    }
+
+    $brain_tile{busy} = 1;
+    $brain_tile{reset}->configure(-state => 'disabled');
+    $brain_tile{status}->configure(
+        -text => 'deleting the brain and training a new one, this takes a minute...');
+    my $log = '/tmp/.webcam-brain-retrain.log';
+    unlink $log;
+    $brain_tile{log} = $log;
+
+    my $quoted = WebcamEnhance::shell_quote($trainer);
+    my $pid = fork();
+    if (!defined $pid) {
+        $brain_tile{busy} = 0;
+        $brain_tile{reset}->configure(-state => 'normal');
+        $brain_tile{status}->configure(-text => 'could not start the retraining');
+        return;
+    }
+    if ($pid == 0) {
+        # The child. exec rather than system, so there is one process and the
+        # parent's wait sees it finish.
+        # exec, not system, so there is one process and the parent's waitpid
+        # sees it finish. The || is what keeps perl from warning that the exit
+        # is unreachable.
+        exec("python3 $quoted --reset-retrain --quiet >$log 2>&1") || exit 1;
+    }
+    $brain_tile{pid} = $pid;
+    $brain_tile{mw}->after(600, \&poll_reset_brain);
+    return 1;
+}
+
+sub poll_reset_brain {
+    return unless $brain_tile{busy};
+    my $pid = $brain_tile{pid};
+    my $done = $pid ? waitpid($pid, 1) : -1;        # 1 is WNOHANG
+
+    # Show the latest line it has written, so there is something moving.
+    if (open my $fh, '<', ($brain_tile{log} || '')) {
+        my @lines = grep { /\S/ } <$fh>;
+        close $fh;
+        if (@lines) {
+            my $last = $lines[-1];
+            chomp $last;
+            $brain_tile{status}->configure(-text => substr($last, 0, 160));
+        }
+    }
+
+    if ($done == 0) {
+        $brain_tile{mw}->after(600, \&poll_reset_brain);
+        return;
+    }
+
+    $brain_tile{busy} = 0;
+    $brain_tile{pid} = undef;
+    $brain_tile{reset}->configure(-state => 'normal');
+    refresh_brain_tile();
+    return 1;
 }
 
 sub refresh_brain_tile {
@@ -1487,6 +1645,9 @@ for my $p (@presets) {
     $preset_frame->Button(
         -text => $label, -bg => $bg, -fg => $fg, -width => 10,
         -command => sub {
+            # Tell the harvest which preset is in force, so every still filed
+            # from now on is filed under the preset that produced it.
+            WebcamEnhance::note_preset($name) if enhance_module();
             $preset_status->configure(-text => "Applying $name...");
             $mw->update;
             my $ok = run_preset($name);
