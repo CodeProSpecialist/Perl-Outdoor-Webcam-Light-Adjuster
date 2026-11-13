@@ -1686,6 +1686,18 @@ my $ERROR_LINES = 400;
 # should not be. A set written between two polls is on screen within
 # $COMPARE_POLL rather than waiting out a fixed half minute.
 my $COMPARE_POLL  = 3_000;    # ms - look at the file times this often
+
+# ---- the lock panel ----
+#
+# Twenty of the newest detection crops to choose a target from, laid out five
+# across and four down under the comparison frames, and how often the list is
+# looked at again.
+my %lock_tile;
+my $LOCK_BOXES        = 20;
+my $LOCK_COLUMNS      = 5;
+my $LOCK_THUMB_WIDTH  = 132;
+my $LOCK_POLL         = 8_000;    # ms
+my $LOCK_FILE = ($ENV{HOME} || '/root') . '/.webcam-object-lock.json';
 my $COMPARE_FORCE = 30_000;   # ms - reload anyway after this long
 
 # The colour each stage's failures are marked in, so that a wall of traceback
@@ -1864,6 +1876,335 @@ sub build_status_tile {
     $status_tile{mw}->after($ERROR_POLL, \&poll_error_log);
     $status_tile{mw}->after($COMPARE_POLL, \&poll_compare_frames);
     return $frame;
+}
+
+# ---- the locked-on target ----
+#
+# Why a locked target at all. Everything above this meters the whole frame:
+# the light meter averages it, the CLAHE spreads it, the detector lifts
+# whatever it finds. That is the right default and it is also why the car
+# across the road comes out badly - it is two per cent of the frame, so the
+# security light at the far end of the yard wins every argument about
+# exposure. Pick that car here and the arguments are settled in its favour
+# instead, around the clock: the light meter aims its target brightness at
+# the car and its bit of kerb rather than at the whole yard, and the
+# correction gives that box the hardest lift and the crop it keeps.
+#
+# Two ways to pick, because a mouse and a keyboard suit different moments:
+# click the picture itself, or use the Lock button under it. Either locks on;
+# Unlock goes back to metering the whole frame.
+#
+# The pictures are the detector's own crops - the folder of cars rather than
+# the folder of the yard with a car in the corner of it - newest first. They
+# only appear once the detector has found something, so an empty panel on a
+# first run is an ordinary quiet night and says so rather than looking
+# broken.
+sub build_lock_panel {
+    my ($parent) = @_;
+
+    my $frame = $parent->Frame(-borderwidth => 1, -relief => 'sunken');
+    $frame->pack(-side => 'top', -fill => 'x', -padx => 4, -pady => 3);
+    $lock_tile{frame} = $frame;
+    $lock_tile{mw} = $parent->toplevel;
+
+    my $bar = $frame->Frame->pack(-fill => 'x');
+    $bar->Label(-text => 'lock on to a car or object to watch 24 hours a day',
+                -font => 'Helvetica 9 bold')->pack(-side => 'left', -padx => 4);
+    $lock_tile{summary} = $bar->Label(-text => 'reading the lock...',
+        -font => 'Helvetica 8 bold', -fg => '#036', -anchor => 'w');
+    $lock_tile{summary}->pack(-side => 'left', -padx => 4);
+    $bar->Button(-text => 'Unlock - meter the whole frame again',
+                 -font => 'Helvetica 8', -command => \&on_unlock)
+        ->pack(-side => 'right', -padx => 2);
+    $bar->Button(-text => 'Refresh the pictures', -font => 'Helvetica 8',
+                 -command => sub { refresh_lock_panel() })
+        ->pack(-side => 'right', -padx => 2);
+
+    $frame->Label(-text => 'Click a picture, or press its Lock button, to '
+                         . 'make that object the target. The light meter then '
+                         . 'exposes for it instead of for the whole frame, '
+                         . 'and the correction gives it the strongest lift - '
+                         . 'day and night, until it is unlocked.',
+                  -font => 'Helvetica 8', -fg => '#333', -anchor => 'w',
+                  -justify => 'left', -wraplength => 740)
+        ->pack(-fill => 'x', -padx => 6, -pady => 1);
+
+    # The current target, shown as a picture of its own so that what is
+    # locked is never in doubt - a label saying "car" is true of every car on
+    # the street.
+    my $current = $frame->Frame->pack(-fill => 'x', -padx => 6, -pady => 2);
+    $current->Label(-text => 'locked target:', -font => 'Helvetica 8 bold',
+                    -anchor => 'w')->pack(-side => 'left');
+    $lock_tile{current_image} = $current->Label(
+        -text => '(none)', -font => 'Helvetica 8', -fg => '#888',
+        -background => '#101010', -width => 20, -height => 5);
+    $lock_tile{current_image}->pack(-side => 'left', -padx => 6);
+    $lock_tile{current_note} = $current->Label(
+        -text => '', -font => 'Helvetica 8', -fg => '#333', -anchor => 'w',
+        -justify => 'left', -wraplength => 520);
+    $lock_tile{current_note}->pack(-side => 'left', -fill => 'x');
+
+    $lock_tile{note} = $frame->Label(-text => '', -font => 'Helvetica 8',
+        -fg => '#666', -anchor => 'w', -justify => 'left',
+        -wraplength => 740);
+    $lock_tile{note}->pack(-fill => 'x', -padx => 6);
+
+    # The twenty boxes. Built empty and filled by the helper's answer, so the
+    # window maps at once rather than waiting on twenty JPEGs being scaled.
+    my $grid = $frame->Frame->pack(-fill => 'x', -padx => 6, -pady => 2);
+    $lock_tile{cells} = [];
+    $lock_tile{photo} = {};        # index -> Tk::Photo, held against GC
+    $lock_tile{paths} = {};        # index -> the crop that box is showing
+    for my $index (0 .. $LOCK_BOXES - 1) {
+        my $row    = int($index / $LOCK_COLUMNS);
+        my $column = $index % $LOCK_COLUMNS;
+        $lock_tile{lines}[$row] ||= $grid->Frame->pack(-fill => 'x');
+        my $cell = $lock_tile{lines}[$row]->Frame(-borderwidth => 1,
+                                                  -relief => 'sunken');
+        $cell->pack(-side => 'left', -padx => 3, -pady => 3);
+        my $picture = $cell->Label(-text => '(empty)', -font => 'Helvetica 7',
+            -fg => '#777', -background => '#101010',
+            -width => 18, -height => 5, -cursor => 'hand2');
+        $picture->pack;
+        $picture->bind('<Button-1>', sub { on_lock_pick($index) });
+        my $caption = $cell->Label(-text => '', -font => 'Helvetica 7',
+                                   -fg => '#222', -anchor => 'w');
+        $caption->pack(-fill => 'x');
+        my $button = $cell->Button(-text => 'Lock', -font => 'Helvetica 7',
+            -state => 'disabled', -command => sub { on_lock_pick($index) });
+        $button->pack(-fill => 'x');
+        $lock_tile{cells}[$index] = { picture => $picture,
+                                      caption => $caption,
+                                      button  => $button };
+    }
+
+    refresh_lock_panel();
+    $lock_tile{mw}->after($LOCK_POLL, \&poll_lock_panel);
+    return $frame;
+}
+
+# Ask webcam_status.py for the newest crops and what is locked.
+#
+# Same arrangement the status tile uses - a child process writing to a file,
+# polled on a timer - because scaling twenty JPEGs on the main thread would
+# freeze the window for as long as it took. The helper answers --lock-lines
+# before it touches TensorFlow, so this costs a fraction of the library
+# check.
+sub refresh_lock_panel {
+    return if $lock_tile{busy};
+    my $helper = helper_beside('webcam_status.py');
+    unless (length $helper) {
+        $lock_tile{summary}->configure(
+            -text => 'webcam_status.py is not here beside this script',
+            -fg => '#a00');
+        return;
+    }
+    $lock_tile{busy} = 1;
+    my $out = '/tmp/.webcam-lock.txt';
+    unlink $out;
+    $lock_tile{out} = $out;
+    my $quoted = $helper;
+    $quoted =~ s/(['\\])/\\$1/g;
+    my $pid = fork();
+    if (!defined $pid) {
+        $lock_tile{busy} = 0;
+        $lock_tile{summary}->configure(-text => 'could not read the lock',
+                                       -fg => '#a00');
+        return;
+    }
+    if ($pid == 0) {
+        exec("python3 '$quoted' --lock-lines --thumb-width "
+             . "$LOCK_THUMB_WIDTH >$out 2>/dev/null") || exit 1;
+    }
+    $lock_tile{pid} = $pid;
+    $lock_tile{mw}->after(400, \&poll_lock_helper);
+    return 1;
+}
+
+sub poll_lock_helper {
+    return unless $lock_tile{busy};
+    my $pid = $lock_tile{pid};
+    my $done = $pid ? waitpid($pid, 1) : -1;          # 1 is WNOHANG
+    if ($done == 0) {
+        $lock_tile{mw}->after(400, \&poll_lock_helper);
+        return;
+    }
+    $lock_tile{busy} = 0;
+    $lock_tile{pid} = undef;
+
+    my @lines;
+    if (open my $fh, '<', ($lock_tile{out} || '')) {
+        @lines = <$fh>;
+        close $fh;
+    }
+    my (@crops, @notes, $current);
+    for my $line (@lines) {
+        chomp $line;
+        my @field = split /\|/, $line, -1;
+        next unless @field;
+        push @crops, \@field  if $field[0] eq 'LOCK';
+        push @notes, $field[1] if $field[0] eq 'NOTE';
+        $current = \@field    if $field[0] eq 'LOCKED';
+    }
+    draw_lock_panel(\@crops, $current, join("\n", @notes));
+    return 1;
+}
+
+sub draw_lock_panel {
+    my ($crops, $current, $note) = @_;
+
+    for my $index (0 .. $LOCK_BOXES - 1) {
+        my $cell = $lock_tile{cells}[$index] or next;
+        my $crop = $crops->[$index];
+        unless ($crop) {
+            $cell->{picture}->configure(-image => undef, -text => '(empty)',
+                -fg => '#777', -width => 18, -height => 5,
+                -borderwidth => 1, -relief => 'flat');
+            $cell->{caption}->configure(-text => '');
+            $cell->{button}->configure(-text => 'Lock', -state => 'disabled');
+            delete $lock_tile{photo}{$index};
+            delete $lock_tile{paths}{$index};
+            next;
+        }
+        my (undef, $path, $label, $stamp, $is_locked, $thumb) = @$crop;
+        $lock_tile{paths}{$index} = $path;
+        if (length($thumb || '') && -f $thumb) {
+            # A new Photo each time rather than a reload: Tk caches by
+            # filename and the helper writes a new name for each width, so
+            # reusing one would show the old size after a resize.
+            my $photo = eval { $lock_tile{mw}->Photo(-file => $thumb,
+                                                     -format => 'ppm') };
+            if ($photo) {
+                $lock_tile{photo}{$index} = $photo;
+                $cell->{picture}->configure(-image => $photo, -text => '');
+            } else {
+                $cell->{picture}->configure(-image => undef,
+                    -text => '(unreadable)', -fg => '#a00');
+            }
+        } else {
+            $cell->{picture}->configure(-image => undef,
+                -text => '(no thumbnail)', -fg => '#777');
+        }
+        $stamp = '' unless defined $stamp;
+        $stamp =~ s/^.*\s//;            # the time, without the date
+        $cell->{caption}->configure(-text => "$label  $stamp");
+        if ($is_locked) {
+            $cell->{button}->configure(-text => 'LOCKED', -state => 'normal',
+                                       -background => '#bbeebb');
+            $cell->{picture}->configure(-borderwidth => 3,
+                                        -relief => 'solid');
+        } else {
+            $cell->{button}->configure(-text => 'Lock', -state => 'normal');
+            $cell->{picture}->configure(-borderwidth => 1,
+                                        -relief => 'flat');
+        }
+    }
+
+    if (@$crops) {
+        $lock_tile{note}->configure(
+            -text => scalar(@$crops) . ' of the newest detections shown, '
+                   . 'newest first', -fg => '#666');
+    } else {
+        $lock_tile{note}->configure(
+            -text => 'no detections yet - these boxes fill up as the '
+                   . 'detector finds cars and people in the corrected '
+                   . 'frames, so an empty panel on a first run is normal',
+            -fg => '#666');
+    }
+
+    $lock_tile{summary}->configure(
+        -text => (length($note || '') ? $note : 'no object locked'),
+        -fg => ($current ? '#0a7a2a' : '#036'));
+
+    if ($current) {
+        my (undef, $label, $source, $thumb) = @$current;
+        if (length($thumb || '') && -f $thumb) {
+            my $photo = eval { $lock_tile{mw}->Photo(-file => $thumb,
+                                                     -format => 'ppm') };
+            if ($photo) {
+                $lock_tile{current_photo} = $photo;
+                $lock_tile{current_image}->configure(-image => $photo,
+                                                     -text => '');
+            }
+        }
+        my $name = $source || '';
+        $name =~ s{.*/}{};
+        $lock_tile{current_note}->configure(
+            -text => "the light meter is exposing for this $label and the "
+                   . "correction is giving it the strongest lift. Picked "
+                   . "from $name");
+    } else {
+        $lock_tile{current_image}->configure(-image => undef,
+            -text => '(none)', -fg => '#888', -width => 20, -height => 5);
+        delete $lock_tile{current_photo};
+        $lock_tile{current_note}->configure(
+            -text => 'nothing locked - the light meter is exposing for the '
+                   . 'whole frame, which is the default');
+    }
+    return 1;
+}
+
+# Lock on to whatever is in that box. webcam_lock.py does the writing, so
+# that the lock this window sets and the lock the python window sets are the
+# same file written by the same code.
+sub on_lock_pick {
+    my ($index) = @_;
+    my $path = $lock_tile{paths}{$index};
+    return unless defined $path && length $path;
+    my $script = helper_beside('webcam_lock.py');
+    unless (length $script) {
+        $lock_tile{note}->configure(
+            -text => 'webcam_lock.py is not here beside this script, so '
+                   . 'there is nothing to lock on with', -fg => '#a00');
+        return;
+    }
+    my $qs = $script; $qs =~ s/(['\\])/\\$1/g;
+    my $qp = $path;   $qp =~ s/(['\\])/\\$1/g;
+    my $answer = `python3 '$qs' set '$qp' 2>&1`;
+    if (defined $answer && $answer =~ /^locked/) {
+        term_write("locked on to the object in $path - the light meter "
+                     . "and the correction now work to this target\n");
+    } else {
+        chomp($answer = $answer || 'no answer');
+        $lock_tile{note}->configure(-text => "could not lock on: $answer",
+                                    -fg => '#a00');
+    }
+    refresh_lock_panel();
+    return 1;
+}
+
+sub on_unlock {
+    my $script = helper_beside('webcam_lock.py');
+    if (length $script) {
+        my $qs = $script; $qs =~ s/(['\\])/\\$1/g;
+        system("python3 '$qs' clear >/dev/null 2>&1");
+    } else {
+        unlink $LOCK_FILE;
+    }
+    term_write("unlocked - metering the whole frame again\n");
+    refresh_lock_panel();
+    return 1;
+}
+
+# Pick up new detections without being asked: the newest crop's time and the
+# lock file's, and a reload only when one of them has moved.
+sub poll_lock_panel {
+    my $newest = 0;
+    for my $index (0 .. $LOCK_BOXES - 1) {
+        my $path = $lock_tile{paths}{$index} or next;
+        my $when = (stat $path)[9] || 0;
+        $newest = $when if $when > $newest;
+    }
+    my $locked = (stat $LOCK_FILE)[9] || 0;
+    my $stamp = "$newest/$locked";
+    my $due = (time - ($lock_tile{loaded} || 0)) >= 60;
+    if ($stamp ne ($lock_tile{stamp} || '') || $due) {
+        $lock_tile{stamp}  = $stamp;
+        $lock_tile{loaded} = time;
+        refresh_lock_panel();
+    }
+    $lock_tile{mw}->after($LOCK_POLL, \&poll_lock_panel);
+    return 1;
 }
 
 # How wide the pair of pictures should be: the width of the terminal above
@@ -2364,6 +2705,7 @@ build_brain_tile($page);
 # because it is the tallest of the three and the one read when something has
 # already gone wrong.
 build_status_tile($page);
+build_lock_panel($page);
 my ($r1, $r2) = (0, 0);
 
 # ---- Column one: a control for everything the camera reported ----

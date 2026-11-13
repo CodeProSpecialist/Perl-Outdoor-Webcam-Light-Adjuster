@@ -874,18 +874,40 @@ my $MAX_COLD    = 0.300;     # at most 30% of the frame crushed to black
 # level lift rather than exposure, so it buys apparent brightness at the cost
 # of the black end, which is the mistake the old maximum-brightness night
 # preset made. Contrast rises with the trim to keep the range spread out once
-# gain has lifted everything. Saturation comes DOWN as the trim goes up, which
-# is the "a little bit less colour at night" part - colour is never switched
-# off at any trim, there is just less of it when the gain is high and most of
-# the colour left is noise.
+# gain has lifted everything.
+#
+# Saturation used to be in here, coming down as the trim went up. It is out
+# now, deliberately: the colour level a preset asks for is the colour level
+# that is wanted, at every hour, and a meter quietly walking it down five
+# steps into the night is the meter overruling the preset about how the
+# picture should look. The colour wanted at night is set in the night preset
+# itself, where it can be seen and changed. See %locked_ctrls below.
 my %trim_rule = (
     gain                   =>  0.120,
     brightness             =>  0.025,
     contrast               =>  0.030,
-    saturation             => -0.025,
     backlight_compensation =>  0.200,
 );
 my @trim_ctrls = sort keys %trim_rule;
+
+# The controls this loop is not allowed to move, whatever the picture looks
+# like.
+#
+# Saturation and hue belong to the preset outright: they decide what the
+# colours *are*, not how bright the frame is, and no amount of metering the
+# grey level is evidence about either. Gamma is the awkward one and gets a
+# rule of its own - it does change brightness, which is exactly why it is
+# tempting, and raising it is the cheapest-looking way to brighten a night
+# frame. It is also the worst: gamma lifts the noise floor along with the
+# shadows and flattens the midtones the number plate lives in, and it does it
+# to the stream the recorder is writing rather than to a copy. So gamma may be
+# left where the preset put it or pulled back DOWN from there, and never
+# raised above it. The software correction, which works on copies of the
+# stills and can be deleted and redone, is where a gamma lift belongs.
+my @LOCKED_CTRLS = ('saturation', 'hue');
+my $GAMMA_CTRL   = 'gamma';
+my @locked_have  = ();       # which of them this camera actually has
+my %locked_base  = ();       # and the values the preset gave them
 
 # The ranges to use when the camera does not report one.
 #
@@ -924,6 +946,38 @@ my $ctrl_has_focus;          # whichever continuous-autofocus control this camer
 # pre-5.10 kernel name on the older webcam.
 my $FOCUS_CTRL        = 'focus_automatic_continuous';
 my $FOCUS_CTRL_LEGACY = 'focus_auto';
+
+# The manual focus control, read so that the preset's focus distance can be
+# kept and gone back to.
+my $FOCUS_ABS_CTRL = 'focus_absolute';
+my $ctrl_focus_abs;          # the name, when this camera has it
+my @focus_range;             # its range, for the drift window
+my $focus_base;              # where the preset left the focus
+
+# How far the focus may wander from where the preset left it before it is put
+# back, as a fraction of the control's range. Twelve per cent is about a foot
+# at the distance these cameras are aimed at: enough slack for the autofocus
+# to find the edge of a car properly, not enough for it to give up and go
+# hunting the fence behind it or the moth in front of it.
+my $FOCUS_WINDOW = 0.12;
+
+# How blurry the picture has to be before the autofocus is allowed to re-run.
+#
+# This is the variance of the Laplacian - the standard "is it in focus" number
+# - taken on a half size grey copy. A sharp daylight frame from this camera
+# runs in the hundreds; a frame that has lost focus runs in the low tens. The
+# night threshold is lower because a correctly focused night frame is
+# genuinely less detailed than a correctly focused day one, and judging night
+# by the day number would have the autofocus hunting all night, which is the
+# exact behaviour that puts a soft first few seconds into every recording.
+my $BLUR_DAY   = 55.0;
+my $BLUR_NIGHT = 22.0;
+# The gain fraction where the easing off starts - the same knee the sharpness
+# curve uses, repeated here because this is declared earlier in the file than
+# that curve is.
+my $BLUR_KNEE  = 0.50;
+my $last_blur;               # the last reading, for the status line
+my $lock_note = '';          # what the locked-on target did this pass
 
 my $TRIM_MAX = 5;            # steps either side of whatever the preset set
 
@@ -971,6 +1025,24 @@ sub meter_learn_ranges {
     $ctrl_has_focus = $seen{$FOCUS_CTRL}        ? $FOCUS_CTRL
                     : $seen{$FOCUS_CTRL_LEGACY} ? $FOCUS_CTRL_LEGACY
                     :                             undef;
+
+    # The manual focus control, if the camera has one. Only read, and only
+    # ever written back to the value the preset asked for.
+    $ctrl_focus_abs = $seen{$FOCUS_ABS_CTRL} ? $FOCUS_ABS_CTRL : undef;
+    if ($ctrl_focus_abs) {
+        for my $line (@lines) {
+            next unless $line =~ /^\s*\Q$FOCUS_ABS_CTRL\E\s/;
+            my ($min) = $line =~ /min=(-?\d+)/;
+            my ($max) = $line =~ /max=(-?\d+)/;
+            @focus_range = ($min, $max)
+                if defined $min && defined $max && $max > $min;
+        }
+    }
+
+    # Which of the hands-off controls this camera actually has, so that the
+    # guard reads back only what exists.
+    @locked_have = grep { $seen{$_} } (@LOCKED_CTRLS, $GAMMA_CTRL);
+    meter_learn_locked($dev);
 
     # Same test the preset engine uses to tell the two cameras apart.
     $camera_kind = 'modern' if $seen{exposure_time_absolute};
@@ -1413,11 +1485,79 @@ sub meter_harvest {
     return undef;
 }
 
+# ---- the locked-on target ----
+#
+# One object picked out in the window - a particular car on the kerb, a
+# particular doorway - and kept as *the* thing these programs are trying to
+# get a good picture of, around the clock. The lock itself lives in
+# ~/.webcam-object-lock.json, written by the window and read here, and the
+# matching is done by webcam_lock.py, which is shared with the python repo so
+# that both lock on to the same object by the same rules.
+my $LOCK_FILE = ($ENV{HOME} || '/root') . '/.webcam-object-lock.json';
+
+# Where a file that ships beside this scheduler actually lives.
+sub find_beside {
+    my ($name) = @_;
+    for my $dir (File::Basename::dirname(Cwd::abs_path($0)),
+                 home_dir(), Cwd::getcwd()) {
+        next unless defined $dir;
+        my $path = "$dir/$name";
+        return $path if -r $path;
+    }
+    return undef;
+}
+
+# Is anything locked? A stat, so it can be asked every pass.
+sub meter_lock_is_set {
+    return -s $LOCK_FILE ? 1 : 0;
+}
+
+# Where the locked-on target is in this still, as a crop written beside the
+# lock, or nothing.
+#
+# The matching itself is done by webcam_lock.py, which is shared with the
+# python programs so that both repos lock on to the same object by the same
+# rules and one lock file serves both. Perl asks it for a file name and gets
+# on with measuring, which is all this side needs.
+sub meter_lock_region {
+    my ($f) = @_;
+    return undef unless defined $f && -e $f;
+    my $script = find_beside('webcam_lock.py');
+    return undef unless defined $script && -e $script;
+    my $out = `python3 "$script" roi "$f" 2>/dev/null`;
+    return undef unless defined $out;
+    chomp $out;
+    my ($path, $how, $label) = split /\t/, $out;
+    return undef unless defined $path && length $path && -e $path;
+    return { path => $path, how => ($how || 'found'),
+             label => ($label || 'object') };
+}
+
 sub meter_measure {
     my ($f) = @_;
     return () unless defined $f;
     my $im = magick_cmd();
     return () unless length $im;
+
+    # The locked-on target, when there is one. Everything below is unchanged
+    # - it just runs on a crop of the target and its surroundings instead of
+    # on the whole frame, which is the whole point of locking on: the
+    # exposure is then decided by the car, and the floodlight at the far end
+    # of the yard gets a vote proportional to how much of the car it lights
+    # rather than to how bright it is.
+    $lock_note = '';
+    if (meter_lock_is_set()) {
+        my $found = meter_lock_region($f);
+        if ($found) {
+            $f = $found->{path};
+            $lock_note = "metering the locked $found->{label} "
+                       . "($found->{how})";
+        } else {
+            $lock_note = 'locked target not found in this frame - metering '
+                       . 'the whole frame';
+        }
+    }
+
     my $mean = `$im "$f" -colorspace Gray -resize 25% -format "%[fx:mean*255]" info: 2>/dev/null`;
     return () unless defined $mean && $mean =~ /([\d.]+)/;
     $mean = $1;
@@ -1430,8 +1570,161 @@ sub meter_measure {
     return ($mean, $hot, 1 - $warm);
 }
 
+# ---- the controls this loop keeps its hands off ----
+
+# Read saturation, hue and gamma as the preset left them, along with the
+# preset's focus distance.
+#
+# These are not trimmed, so the only reason to read them is to be able to tell
+# later whether they are still where the preset put them - and, for gamma,
+# what the ceiling is. Re-read whenever the baseline is re-learnt, because a
+# preset firing is exactly when they legitimately change.
+sub meter_learn_locked {
+    my ($dev) = @_;
+    my @names = @locked_have;
+    push @names, $ctrl_focus_abs if $ctrl_focus_abs;
+    return unless @names;
+    my $list = join(',', @names);
+    my $out = `v4l2-ctl -d $dev --get-ctrl $list 2>/dev/null`;
+    my %found;
+    while ($out =~ /(\w+):\s*(-?\d+)/g) { $found{$1} = $2 + 0; }
+    $focus_base = delete $found{$ctrl_focus_abs}
+        if $ctrl_focus_abs && exists $found{$ctrl_focus_abs};
+    %locked_base = ();
+    for my $name (@locked_have) {
+        $locked_base{$name} = $found{$name} if exists $found{$name};
+    }
+    return \%locked_base;
+}
+
+# Put saturation, hue and gamma back if they have moved off the preset - and,
+# for gamma, only ever downwards.
+#
+# Nothing in this loop writes them, so in normal running this finds nothing
+# and costs one read. It is here for the case that is not normal running:
+# another program, a half-finished preset, or a driver that resets a control
+# when the exposure mode changes. Without it a gamma that got raised once
+# would stay raised for the rest of the night with the correction dutifully
+# metering around it.
+sub meter_guard_locked {
+    my ($dev) = @_;
+    return '' unless @locked_have && keys %locked_base;
+    my $list = join(',', @locked_have);
+    my $out = `v4l2-ctl -d $dev --get-ctrl $list 2>/dev/null`;
+    my %have;
+    while ($out =~ /(\w+):\s*(-?\d+)/g) { $have{$1} = $2 + 0; }
+    my @fixed;
+    for my $name (sort keys %locked_base) {
+        my $want = $locked_base{$name};
+        my $now  = $have{$name};
+        next unless defined $now;
+        next if $now == $want;
+        if ($name eq $GAMMA_CTRL && $now < $want) {
+            # Pulled down, not up. Allowed, and worth keeping: a lower gamma
+            # holds the midtones together. Take it as the new ceiling rather
+            # than undoing it.
+            $locked_base{$name} = $now;
+            next;
+        }
+        system("v4l2-ctl -d $dev --set-ctrl $name=$want 2>/dev/null");
+        push @fixed, "$name $now -> $want";
+    }
+    if (@fixed) {
+        meter_log('put the hands-off controls back: ' . join(', ', @fixed),
+                  always => 1);
+        return 'restored ' . join(', ', @fixed);
+    }
+    return '';
+}
+
+# ---- focus ----
+
+# How sharp the picture actually is: the variance of its Laplacian.
+#
+# A big number is a detailed picture, a small one is a soft picture, and the
+# useful property is that it does not care how bright the frame is - which is
+# what makes it the right test here, where the frame is dark half the time by
+# design.
+#
+# Done with ImageMagick, which these programs already depend on, through the
+# standard deviation of an edge-detected copy; the variance is its square,
+# which is what the thresholds above are written in. Returns nothing when
+# ImageMagick is missing, which means "no opinion" and leaves the focus alone.
+sub meter_blur_score {
+    my ($f) = @_;
+    return undef unless defined $f && -e $f;
+    my $im = magick_cmd();
+    return undef unless length $im;
+    my $out = `$im "$f" -colorspace Gray -resize 50% -define convolve:scale=! -morphology Convolve Laplacian:0 -format "%[fx:standard_deviation*255]" info: 2>/dev/null`;
+    return undef unless defined $out && $out =~ /([\d.]+)/;
+    return $1 * $1;
+}
+
+# The blur threshold for how dark it is now: the day number in daylight,
+# easing to the night number at the top of the gain range.
+sub meter_blur_limit {
+    my ($dev) = @_;
+    my $fraction = enhance_gain_fraction($dev);
+    return $BLUR_DAY unless defined $fraction;
+    return $BLUR_DAY if $fraction <= $BLUR_KNEE;
+    my $into_dark = ($fraction - $BLUR_KNEE) / (1 - $BLUR_KNEE);
+    return $BLUR_DAY - ($BLUR_DAY - $BLUR_NIGHT) * $into_dark;
+}
+
+# Put the focus back near where the preset left it.
+#
+# Only when it has drifted further than $FOCUS_WINDOW, and only to the
+# preset's own value - this never picks a focus distance of its own.
+# Continuous autofocus is switched back on afterwards, because nothing in
+# these programs leaves the camera in manual focus.
+sub meter_hold_focus {
+    my ($dev) = @_;
+    return '' unless $ctrl_focus_abs && defined $focus_base && @focus_range == 2;
+    my ($lo, $hi) = @focus_range;
+    my $window = int($FOCUS_WINDOW * ($hi - $lo) + 0.5);
+    $window = 1 if $window < 1;
+    my $out = `v4l2-ctl -d $dev --get-ctrl $ctrl_focus_abs 2>/dev/null`;
+    return '' unless $out =~ /(\w+):\s*(-?\d+)/;
+    my $now = $2 + 0;
+    return '' if abs($now - $focus_base) <= $window;
+    my $ctrl = defined $ctrl_has_focus ? $ctrl_has_focus : $FOCUS_CTRL;
+    system("v4l2-ctl -d $dev --set-ctrl $ctrl=0 2>/dev/null");
+    system("v4l2-ctl -d $dev --set-ctrl $ctrl_focus_abs=$focus_base 2>/dev/null");
+    select(undef, undef, undef, 0.2);
+    system("v4l2-ctl -d $dev --set-ctrl $ctrl=1 2>/dev/null");
+    meter_log("focus had drifted to $now, put back to the preset's $focus_base",
+              always => 1);
+    return "focus put back to $focus_base";
+}
+
+# Refocus only when the picture is actually blurry.
+#
+# The old behaviour was to re-run the autofocus after every light change, on
+# the grounds that the first seconds after a change come out soft. That is
+# true and it is also how the focus ends up somewhere the preset never asked
+# for: every trim sent the autofocus hunting, and a night scene with nothing
+# well-lit to lock on to is precisely the scene it hunts worst in. Hunting is
+# worse than a slightly stale focus.
+#
+# So the picture gets measured first. Blurry - refocus, which is the case the
+# refocus was put in for. Sharp enough - leave the focus alone and only pull
+# it back if it has wandered out of the window around the preset.
+sub meter_maybe_refocus {
+    my ($dev, $frame) = @_;
+    $last_blur = defined $frame ? meter_blur_score($frame) : undef;
+    my $limit = meter_blur_limit($dev);
+    return meter_hold_focus($dev) unless defined $last_blur;
+    if ($last_blur < $limit) {
+        meter_log(sprintf('picture is blurry (sharpness score %.0f, wanted '
+                        . '%.0f) - refocusing', $last_blur, $limit));
+        meter_refocus($dev);
+        return sprintf('blurry (%.0f < %.0f) - refocused', $last_blur, $limit);
+    }
+    return meter_hold_focus($dev);
+}
+
 # Sharpness, as a fraction of the control's range: full sharpness in daylight
-# and through the golden hours, backed off to 80-90% at night.
+# and through the golden hours, backed off at night.
 #
 # This is set outright rather than trimmed, and it overrides whatever sharpness
 # the preset asked for - including the night preset's deliberately low value.
@@ -1447,8 +1740,21 @@ sub meter_measure {
 # off at all once the gain is high.
 my $SHARP_DAY   = 1.00;      # at or below half gain: full sharpness
 my $SHARP_NIGHT = 0.90;      # just into high gain
-my $SHARP_DARK  = 0.80;      # at the top of the gain range
+my $SHARP_DARK  = 0.70;      # at the top of the gain range
 my $SHARP_KNEE  = 0.50;      # the gain fraction where the easing off starts
+
+# And the two ends sharpness is never allowed outside of, whatever the curve
+# above works out and whatever a preset asked for: half sharpness at the very
+# least, full sharpness at the very most.
+#
+# The floor is the useful half of this. Sharpening amplifies grain, so the
+# honest night answer looks like "turn it down", and turned down far enough
+# the picture is a smooth grey blur with no edge left to read a number plate
+# off - grain-free and useless. Half is the point below which this stops
+# buying anything. The ceiling only says there is no such thing as more than
+# all of a control.
+my $SHARP_FLOOR = 0.50;
+my $SHARP_CEIL  = 1.00;
 
 # Work out the sharpness this amount of gain calls for, in the control's own
 # units. Returns nothing when the camera has no sharpness control or no gain
@@ -1470,6 +1776,11 @@ sub meter_sharpness_for {
         my $into_dark = ($gain_fraction - $SHARP_KNEE) / (1 - $SHARP_KNEE);
         $want = $SHARP_NIGHT - ($SHARP_NIGHT - $SHARP_DARK) * $into_dark;
     }
+    # Clamped to the 50-100% band before it is turned into the control's own
+    # units, so the curve above can be changed freely without any edit of it
+    # being able to put the picture outside the band that is wanted.
+    $want = $SHARP_FLOOR if $want < $SHARP_FLOOR;
+    $want = $SHARP_CEIL  if $want > $SHARP_CEIL;
     my $value = int($slo + ($shi - $slo) * $want + 0.5);
     $value = $slo if $value < $slo;
     $value = $shi if $value > $shi;
@@ -1635,8 +1946,15 @@ sub meter_apply_trim {
     my $sharp = meter_sharpness_for($meter_wrote{gain});
     system("v4l2-ctl -d $dev --set-ctrl sharpness=$sharp 2>/dev/null") if defined $sharp;
 
-    # The light just moved, so give the autofocus a fresh start on it.
-    meter_refocus($dev);
+    # Saturation, hue and gamma are not trimmed; check nothing else moved
+    # them, and pull gamma back down if it was raised.
+    meter_guard_locked($dev);
+
+    # The light just moved. Whether that costs any sharpness is a question
+    # about the picture, so it is answered from the picture rather than
+    # assumed: refocus if it has actually gone soft, otherwise hold the
+    # preset's focus distance.
+    meter_maybe_refocus($dev, meter_snapshot());
 
     # And the same controls again, afterwards. A moment first: a driver does
     # not always report a new value the instant it is written, and reading
@@ -1699,8 +2017,16 @@ sub meter_pass {
             # the wanted sharpness back for the gain this preset runs at.
             my $sharp = meter_sharpness_for($have{gain});
             system("v4l2-ctl -d $dev --set-ctrl sharpness=$sharp 2>/dev/null") if defined $sharp;
-            # A preset just changed the light, so refocus for it as well.
-            meter_refocus($dev);
+            # The preset owns saturation, hue, gamma and the focus distance,
+            # so whatever it just set them to is the new reference the guard
+            # holds them at.
+            meter_learn_locked($dev);
+            # A preset just changed the light. Measure the picture before
+            # deciding whether the focus needs anything: a preset change does
+            # not make a sharp picture blurry, and the old
+            # refocus-on-every-change is what used to walk the focus off the
+            # distance the preset was set up for.
+            meter_maybe_refocus($dev, meter_snapshot());
             # A preset or a hand on a slider just changed the light. This is
         # exactly the moment worth filing: the scene is the same and the
         # exposure is different, which is how the training set gets this
@@ -1799,6 +2125,8 @@ sub meter_pass {
     my $status = sprintf(
         'light meter: trim %+d, mean %d of target %d, white %.1f%%, black %.0f%% - %s',
         $trim, $m, $mean_target, $hot * 100, $cold * 100, $why);
+    $status .= sprintf(' | sharpness score %.0f', $last_blur) if $last_blur;
+    $status .= " | $lock_note" if length $lock_note;
     $status .= " | $enhanced" if defined $enhanced;
     $status .= " | $trained" if defined $trained;
     return $status;
