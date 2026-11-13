@@ -80,6 +80,12 @@ sub ensure {
 
     return if $ENV{WEBCAM_NO_BOOTSTRAP};
 
+    # A name in the program table is a program, not a module. Taking one as
+    # a module name is how the Python side used to refuse to start on a
+    # machine that had the ffmpeg encoder but no same-named package from
+    # PyPI, so the same guard is here.
+    @modules = grep { !exists $APT_FOR_PROGRAM{$_} } @modules;
+
     my @missing = grep { _module_missing($_) } @modules;
 
     my @missing_programs =
