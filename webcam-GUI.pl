@@ -2527,6 +2527,49 @@ push @led_buttons, $led_row->Button(
 push @led_buttons, $led_row->Button(
     -text => 'LED on', -font => 'Helvetica 8',
     -command => sub { set_led('on') })->pack(-side => 'left', -padx => 3);
+# The other half of the question: not "is the LED off" but "is anything this
+# window sends reaching the stream the recorder is taping". Controls are per
+# device rather than per handle, so writes from outside the recorder do reach
+# it - what is not guaranteed is that they stay, and v4l2-ctl reports success
+# for a write the camera then ignores. So this reads them back and measures
+# the newest still, and reports what the camera says rather than what it was
+# told.
+sub check_camera_listening {
+    my $helper = helper_beside('webcam_verify.py');
+    unless ($helper) {
+        $led_status->configure(-text => 'webcam_verify.py is not here',
+                               -fg => '#a00');
+        return;
+    }
+    $led_status->configure(-text => 'asking the camera...', -fg => '#036');
+    $led_status->update;
+    my $quoted = $helper;  $quoted =~ s/(['\\])/\\$1/g;
+    my $node   = $device;  $node   =~ s/(['\\])/\\$1/g;
+    my @out;
+    if (open my $fh, '-|',
+        "python3 '$quoted' --measure --device '$node' 2>&1") {
+        @out = <$fh>;
+        close $fh;
+    }
+    my $line = '';
+    for my $l (@out) { chomp $l; $line = $l if $l =~ /^(OK|BAD)/ }
+    unless (length $line) {
+        $led_status->configure(-text => 'the helper printed nothing',
+                               -fg => '#a00');
+        return;
+    }
+    my $ok = $line =~ /^OK/ ? 1 : 0;
+    $line =~ s/^(OK|BAD)\s*//;
+    $led_status->configure(-text => $line, -fg => $ok ? '#0a7a2a' : '#a00');
+}
+
+# Deliberately not in @led_buttons: those grey out on a camera with no LED
+# control, and whether the camera is listening is exactly the question you
+# still want to ask on such a camera.
+$led_row->Button(
+    -text => 'Is the camera listening?', -font => 'Helvetica 8',
+    -command => \&check_camera_listening)->pack(-side => 'left', -padx => 8);
+
 $led_status = $c2->Label(-text => 'reading the camera...', -anchor => 'w',
                          -justify => 'left', -font => 'Helvetica 8',
                          -wraplength => 310, -fg => '#333');

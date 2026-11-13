@@ -375,4 +375,26 @@ if ($AE_MODE == 1) {
         $exp_ctrl, defined $got ? $got : '?');
 }
 
+# Night, checked.
+#
+# This preset puts the black point on black, which is right at midnight and
+# wrong at sunset + 14 minutes when there is still light in the sky - applied
+# then it can crush the whole frame. The light meter would normally pull that
+# back, but it is blind whenever the recorder holds the camera and no snapshot
+# is arriving, and blind it leaves the picture black all night.
+#
+# So the newest snapshot is measured and the preset walked back if the picture
+# has been destroyed. On a properly dark night this measures one frame and
+# does nothing. Out of line with the rest of this script on purpose: the
+# measuring is in python because that is where the image tools are.
+if ($preset eq 'night' || $preset eq 'night_mono') {
+    my $helper = $0;
+    $helper =~ s{[^/]+$}{webcam_verify.py};
+    if (-f $helper) {
+        my $quoted = $helper;  $quoted =~ s/(['\\])/\\$1/g;
+        my $node   = $device;  $node   =~ s/(['\\])/\\$1/g;
+        system("python3 '$quoted' --guard $preset --device '$node'");
+    }
+}
+
 exit 0;
