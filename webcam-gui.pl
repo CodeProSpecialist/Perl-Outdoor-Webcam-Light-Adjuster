@@ -143,6 +143,11 @@ my @panes;
 my $pane_holder = $live_page->Frame->pack(-side => 'top', -fill => 'both',
                                           -expand => 1, -pady => 4);
 
+my $resize_note = $live_page->Label(-text => '', -foreground => '#664400',
+                                    -font => 'Helvetica 9', -anchor => 'w',
+                                    -justify => 'left', -wraplength => 900)
+                            ->pack(-side => 'top', -fill => 'x', -padx => 8);
+
 my $state_row = $live_page->Frame->pack(-side => 'top', -fill => 'x', -padx => 6);
 my $state_dot = $state_row->Label(-text => ' ', -background => '#555555',
                                   -width => 2)->pack(-side => 'left');
@@ -382,6 +387,7 @@ sub build_panes {
 # restart rather than one per pixel.
 my $resize_pending;
 my ($want_w, $want_h) = (0, 0);
+my $pending_preview;        # [w, h] wanted, held back while recording
 
 sub on_pane_resize {
     my ($pane, $width, $height) = @_;
@@ -410,13 +416,34 @@ sub on_pane_resize {
 sub apply_preview_size {
     $resize_pending = undef;
     return if $want_w < 160 || $want_h < 90;
+
+    # Never restart ffmpeg while it is recording. A restart ends the segment
+    # being written and loses the second or so it takes the camera to come
+    # back, and a security recorder must not lose footage because somebody
+    # dragged the window edge. The wanted size is remembered instead and
+    # taken up at the next restart the user asks for anyway - Apply, or
+    # Start Recording - which is also the only moment a gap is expected.
+    # Until then the picture stays at its old size, centred in the pane.
+    if ($recorder->{recording}) {
+        $pending_preview = [ $want_w, $want_h ];
+        $resize_note->configure(-text => sprintf(
+            'Window resized. The video fills the new size at the next Apply '
+          . 'or Start Recording - not now, because resizing the picture '
+          . 'restarts the camera and would break the recording in progress. '
+          . '(wanted: %dx%d)', $want_w, $want_h));
+        return;
+    }
+
+    $pending_preview = undef;
+    $resize_note->configure(-text => '');
     WebcamRecord::write_settings({
         preview_width  => $want_w,
         preview_height => $want_h,
     });
     $settings = WebcamRecord::read_settings();
     $recorder->{settings} = $settings;
-    # The new size only reaches the picture when ffmpeg is restarted with it.
+    # The new size only reaches the picture when ffmpeg is restarted with it,
+    # and here that restart costs nothing: nothing is being kept.
     $recorder->start($recorder->{recording}) if $recorder->is_running;
     return;
 }
@@ -542,7 +569,15 @@ sub apply_settings {
     my ($cap) = $cap_var =~ /(\d+)/;
 
     my $before = scalar WebcamRecord::cameras_of($settings);
+    # A resize held back while recording rides along with this restart, which
+    # is the gap the user has already asked for by pressing the button.
+    my %held = $pending_preview
+             ? (preview_width  => $pending_preview->[0],
+                preview_height => $pending_preview->[1]) : ();
+    $pending_preview = undef;
+    $resize_note->configure(-text => '');
     WebcamRecord::write_settings({
+        %held,
         cameras         => join(',', @cameras),
         width           => $width,
         height          => $height,
