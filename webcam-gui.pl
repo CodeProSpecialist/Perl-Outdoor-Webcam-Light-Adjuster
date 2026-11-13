@@ -24,7 +24,7 @@ use strict;
 # already missed whatever happened while it waited, and the loop cap is what
 # makes that safe: recording from the moment it opens can only ever use the
 # archive's own cap, and the oldest footage is recycled rather than the disk
-# filling up. Preview only is one press away for when a camera is being aimed.
+# filling up.
 #
 #     perl webcam-gui.pl
 #
@@ -157,12 +157,6 @@ my $button_row = $live_page->Frame->pack(-side => 'top', -fill => 'x',
 $button_row->Button(-text => 'Start Recording', -width => 16,
                     -background => '#cc3333', -foreground => 'white',
                     -command => sub { apply_settings(); $recorder->start(1) })
-           ->pack(-side => 'left', -padx => 2);
-$button_row->Button(-text => 'Preview only', -width => 14,
-                    -command => sub { apply_settings(); $recorder->start(0) })
-           ->pack(-side => 'left', -padx => 2);
-$button_row->Button(-text => 'Stop', -width => 10,
-                    -command => sub { $recorder->stop })
            ->pack(-side => 'left', -padx => 2);
 $button_row->Button(-text => 'Free space now', -width => 15,
                     -command => \&on_janitor)
