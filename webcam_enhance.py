@@ -101,6 +101,15 @@ KEY_ALL_DAY = 'all_day_clahe_ml'
 # corrected at all, because the detector needs the correction to see.
 KEY_DETECT = 'detect_and_boost'
 
+# Optional, off by default: as well as the stills the recorder writes, open
+# the camera every so often and correct a frame straight off the stream. The
+# stills are the default source and cost nothing, because something else is
+# writing them anyway; this goes to the device, which is usually held by the
+# recorder, so it is opt-in and gives up quietly when the camera is busy.
+KEY_SAMPLE_STREAM = 'sample_the_stream'
+KEY_SAMPLE_SECONDS = 'sample_seconds'
+DEFAULT_SAMPLE_SECONDS = 300
+
 # How many consecutive stills to average, and how old the oldest of them may
 # be. The window matters: stills from twenty minutes apart are two different
 # scenes and averaging them smears one over the other. Three minutes at the
@@ -283,9 +292,31 @@ _brain.why = ''
 
 
 def read_settings():
-    """The two switches, as they stand on disk. Both off when there is no
-    file - which is how this behaved before it existed."""
-    settings = {KEY_NIGHT: False, KEY_ALL_DAY: False, KEY_DETECT: False}
+    """The switches, as they stand on disk, with their defaults underneath.
+
+    The 24 hour correction starts **on**. Every preset across the day -
+    night, night mono, golden AM, day, bright sun, golden PM - produces
+    stills, and all of them are worth correcting: the daylight ones are not
+    dark but they are flat, and the same stack-CLAHE-brain G chain is what
+    the detector then has to work with. Correcting only at night left two
+    thirds of the day untouched.
+
+    Object detection starts on with it, since boosting a car or a person is
+    the point of correcting the frame at all, and it is wanted in daylight
+    too and not only in the dark.
+
+    Stream sampling starts **off**, deliberately. The stills are the default
+    source and they cost nothing: the recorder is writing them anyway. Going
+    to the camera directly means opening a device something else is usually
+    holding, so it stays opt-in.
+
+    A conf file written before any of these keys existed falls back to these
+    same defaults for the keys it does not mention, so an old file means
+    "corrected" rather than silently meaning "never corrected".
+    """
+    settings = {KEY_NIGHT: False, KEY_ALL_DAY: True, KEY_DETECT: True,
+                KEY_SAMPLE_STREAM: False,
+                KEY_SAMPLE_SECONDS: DEFAULT_SAMPLE_SECONDS}
     try:
         with open(CONF_FILE, encoding='utf-8') as handle:
             for line in handle:
@@ -293,14 +324,23 @@ def read_settings():
                     continue
                 key, _, value = line.partition('=')
                 key = key.strip()
-                if key in settings:
+                if key == KEY_SAMPLE_SECONDS:
+                    # The one setting that is a number rather than a switch.
+                    # A bad value falls back to the default instead of
+                    # stopping the correction over a typo.
+                    try:
+                        settings[key] = max(30, int(value.strip()))
+                    except ValueError:
+                        pass
+                elif key in settings:
                     settings[key] = value.strip() in ('1', 'true', 'True', 'yes', 'on')
     except OSError:
         pass
     return settings
 
 
-def write_settings(night=None, all_day=None, detect=None):
+def write_settings(night=None, all_day=None, detect=None,
+                   sample_stream=None, sample_seconds=None):
     """Change any of the switches, leaving the others as they were."""
     settings = read_settings()
     if night is not None:
@@ -309,14 +349,27 @@ def write_settings(night=None, all_day=None, detect=None):
         settings[KEY_ALL_DAY] = bool(all_day)
     if detect is not None:
         settings[KEY_DETECT] = bool(detect)
+    if sample_stream is not None:
+        settings[KEY_SAMPLE_STREAM] = bool(sample_stream)
+    if sample_seconds is not None:
+        try:
+            settings[KEY_SAMPLE_SECONDS] = max(30, int(sample_seconds))
+        except (TypeError, ValueError):
+            pass
     try:
         with open(CONF_FILE, 'w', encoding='utf-8') as handle:
             handle.write('# Written by the webcam settings window. Two switches:\n')
             handle.write('#   night image CLAHE and ML auto correct\n')
             handle.write('#   24 hour image CLAHE and ML auto correct\n')
             handle.write('#   find cars and people and enhance them\n')
+            handle.write('# Optionally, as well as the stills:\n')
+            handle.write('#   sample a frame off the camera stream, '
+                         'and how often in seconds\n')
             for key, value in settings.items():
-                handle.write(f'{key}={1 if value else 0}\n')
+                if key == KEY_SAMPLE_SECONDS:
+                    handle.write(f'{key}={int(value)}\n')
+                else:
+                    handle.write(f'{key}={1 if value else 0}\n')
     except OSError:
         return False
     return True

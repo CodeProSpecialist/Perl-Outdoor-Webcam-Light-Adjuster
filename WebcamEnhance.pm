@@ -85,6 +85,15 @@ our $KEY_ALL_DAY = 'all_day_clahe_ml';
 # corrected at all, because the detector needs the correction to see.
 our $KEY_DETECT  = 'detect_and_boost';
 
+# Optional, off by default: as well as the stills the recorder writes, open
+# the camera every so often and correct a frame straight off the stream. The
+# stills are the default source and cost nothing, because something else is
+# writing them anyway; this goes to the device, which is usually held by the
+# recorder, so it is opt-in.
+our $KEY_SAMPLE_STREAM  = 'sample_the_stream';
+our $KEY_SAMPLE_SECONDS = 'sample_seconds';
+our $DEFAULT_SAMPLE_SECONDS = 300;
+
 # Where the brain's training frames come from. Two switches, because the two
 # sources are not the same kind of thing and a camera that is held by the
 # recorder can only offer the first of them.
@@ -140,6 +149,8 @@ sub key_all_day  { return $KEY_ALL_DAY; }
 sub key_detect   { return $KEY_DETECT; }
 sub key_train_pictures { return $KEY_TRAIN_PICTURES; }
 sub key_train_camera   { return $KEY_TRAIN_CAMERA; }
+sub key_sample_stream  { return $KEY_SAMPLE_STREAM; }
+sub key_sample_seconds { return $KEY_SAMPLE_SECONDS; }
 sub conf_file    { return $CONF_FILE; }
 sub stack_depth   { return $STACK_FRAMES; }
 
@@ -150,14 +161,31 @@ sub read_settings {
     # rather than off: a brain trained on this camera's own frames is the
     # point of the harvest, and a conf file written before these two switches
     # existed should not silently mean "never train".
-    my %on = ($KEY_NIGHT => 0, $KEY_ALL_DAY => 0, $KEY_DETECT => 0,
-              $KEY_TRAIN_PICTURES => 1, $KEY_TRAIN_CAMERA => 0);
+    # The 24 hour correction and the detector start on: every mode across
+    # the day produces stills and all of them are worth correcting, and
+    # boosting a car or a person is the point of correcting the frame at all.
+    # Correcting only at night left two thirds of the day untouched. Stream
+    # sampling starts off - the stills cost nothing because the recorder is
+    # writing them anyway, and going to the camera opens a device something
+    # else is usually holding.
+    my %on = ($KEY_NIGHT => 0, $KEY_ALL_DAY => 1, $KEY_DETECT => 1,
+              $KEY_TRAIN_PICTURES => 1, $KEY_TRAIN_CAMERA => 0,
+              $KEY_SAMPLE_STREAM => 0,
+              $KEY_SAMPLE_SECONDS => $DEFAULT_SAMPLE_SECONDS);
     open my $fh, '<', $CONF_FILE or return \%on;
     while (my $line = <$fh>) {
         next if $line =~ /^\s*#/;
         next unless $line =~ /^\s*(\w+)\s*=\s*(\S*)/;
         my ($key, $value) = ($1, $2);
         next unless exists $on{$key};
+        if ($key eq $KEY_SAMPLE_SECONDS) {
+            # The one setting here that is a number rather than a switch. A
+            # bad value keeps the default rather than stopping the
+            # correction over a typo.
+            $on{$key} = $value =~ /^(\d+)$/ && $1 >= 30 ? $1
+                      : $DEFAULT_SAMPLE_SECONDS;
+            next;
+        }
         $on{$key} = ($value =~ /^(1|true|True|yes|on)$/) ? 1 : 0;
     }
     close $fh;
@@ -176,6 +204,13 @@ sub write_settings {
         if exists $args{train_pictures};
     $on->{$KEY_TRAIN_CAMERA}   = $args{train_camera}   ? 1 : 0
         if exists $args{train_camera};
+    $on->{$KEY_SAMPLE_STREAM}  = $args{sample_stream} ? 1 : 0
+        if exists $args{sample_stream};
+    if (exists $args{sample_seconds}) {
+        my $every = $args{sample_seconds};
+        $on->{$KEY_SAMPLE_SECONDS} = $every =~ /^(\d+)$/ && $1 >= 30 ? $1
+                                   : $DEFAULT_SAMPLE_SECONDS;
+    }
     open my $fh, '>', $CONF_FILE or return 0;
     print {$fh} "# Written by the webcam settings window. Two switches:\n";
     print {$fh} "#   night image CLAHE and ML auto correct\n";
@@ -189,6 +224,10 @@ sub write_settings {
     print {$fh} "$KEY_DETECT=$on->{$KEY_DETECT}\n";
     print {$fh} "$KEY_TRAIN_PICTURES=$on->{$KEY_TRAIN_PICTURES}\n";
     print {$fh} "$KEY_TRAIN_CAMERA=$on->{$KEY_TRAIN_CAMERA}\n";
+    print {$fh} "# Optionally, as well as the stills:\n";
+    print {$fh} "#   sample a frame off the camera stream, and how often\n";
+    print {$fh} "$KEY_SAMPLE_STREAM=$on->{$KEY_SAMPLE_STREAM}\n";
+    print {$fh} "$KEY_SAMPLE_SECONDS=$on->{$KEY_SAMPLE_SECONDS}\n";
     close $fh or return 0;
     return 1;
 }

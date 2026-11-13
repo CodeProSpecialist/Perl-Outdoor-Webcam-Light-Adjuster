@@ -2668,7 +2668,11 @@ $c2->Label(-text => 'Error log: ' . meter_log_path(), -anchor => 'w',
 $c2->Label(-text => '--- Night Image Enhancement ---', -font => 'Helvetica 10 bold')
     ->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -pady => 5);
 
-my ($enh_night, $enh_all_day, $enh_detect) = (0, 0, 0);
+# The 24 hour correction and the detector start on, matching the module's own
+# defaults: every mode across the day is corrected unless something turns it
+# off. Stream sampling starts off - it is the optional extra source.
+my ($enh_night, $enh_all_day, $enh_detect) = (0, 1, 1);
+my $enh_sample = 0;
 my $enh_status;
 if (enhance_module()) {
     # Both start at whatever they were left at, not at off: the scheduler has
@@ -2678,6 +2682,7 @@ if (enhance_module()) {
     $enh_night   = $saved->{ WebcamEnhance::key_night() }   ? 1 : 0;
     $enh_all_day = $saved->{ WebcamEnhance::key_all_day() } ? 1 : 0;
     $enh_detect  = $saved->{ WebcamEnhance::key_detect()  } ? 1 : 0;
+    $enh_sample  = $saved->{ WebcamEnhance::key_sample_stream() } ? 1 : 0;
 }
 
 sub enhance_summary {
@@ -2696,7 +2701,8 @@ sub on_enhance_toggle {
     return unless enhance_module();
     my $ok = WebcamEnhance::write_settings(night   => $enh_night,
                                            all_day => $enh_all_day,
-                                           detect  => $enh_detect);
+                                           detect  => $enh_detect,
+                                           sample_stream => $enh_sample);
     my $text = enhance_summary();
     $text .= ' (could not write ' . WebcamEnhance::conf_file() . ')' unless $ok;
     $enh_status->configure(-text => $text) if $enh_status;
@@ -2739,11 +2745,24 @@ if (enhance_module()) {
         -command  => \&on_enhance_toggle,
     )->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);
 
+    $c2->Checkbutton(
+        -text     => 'also sample the camera stream now and then (optional)',
+        -variable => \$enh_sample,
+        -font     => 'Helvetica 8',
+        -anchor   => 'w',
+        -command  => \&on_enhance_toggle,
+    )->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);
+
     $c2->Label(
         -text => "The first box only runs it once the gain is past half its range,\n"
                . "which is the same test the sharpness uses for night - a floodlit\n"
                . "yard at midnight does not get it and an overcast dusk does. The\n"
-               . "second runs it on every still around the clock and overrides the\nfirst.\n\n"
+               . "second runs it on every still around the clock, overrides the\n"
+               . "first, and is on by default so every mode of the day is corrected.\n\n"
+               . "The last box is the optional extra: as well as the stills, open\n"
+               . "the camera every few minutes and correct a frame off the stream.\n"
+               . "The stills cost nothing because the recorder writes them anyway;\n"
+               . "this opens a device the recorder usually holds, so it is off\nunless you want it.\n\n"
                . "The third looks for cars and people in the corrected still and\n"
                . "gives them a second, stronger lift of their own, saving a close\n"
                . "crop of each into a \"detections\" folder. It runs after the\n"
