@@ -1504,6 +1504,75 @@ sub meter_refocus {
 }
 
 # Send the current trim, worked out from the preset's own baseline.
+# ---- before and after, for every adjustment ----
+#
+# "The program sent it" and "the camera took it" are different facts, and only
+# the second one is what the picture is being taken with. v4l2-ctl reports
+# success for a write the camera ignores, a recorder holding the stream can
+# put a value back a moment later, and a driver may round a value to its own
+# step size. Reading every control before and after a change, and writing both
+# down, is the only way to tell those apart - and it turns "the picture did
+# not change" from a mystery into a line saying the camera reported the old
+# value afterwards.
+#
+# Same file and same format as the python side, so one log covers both.
+my $ADJUST_LOG = ($ENV{HOME} || '/root') . '/.webcam-adjustments.log';
+
+sub meter_read_all {
+    my ($dev) = @_;
+    my %v;
+    for my $line (`v4l2-ctl -d $dev -L 2>/dev/null`) {
+        next unless $line =~ /^\s*(\w+)\s+0x[0-9a-f]+\s+\(\w+\)\s*:(.*)$/;
+        my ($name, $rest) = ($1, $2);
+        $v{$name} = $1 if $rest =~ /\bvalue=(-?\d+)/;
+    }
+    return %v;
+}
+
+sub meter_track_adjustment {
+    my ($stage, $before, $after, $asked) = @_;
+    return unless $before && %$before;
+    my %names = map { $_ => 1 } (keys %$before, keys %$after);
+    my (@rows, $asked_n, $took_n);
+    ($asked_n, $took_n) = (0, 0);
+    for my $name (sort keys %names) {
+        my $was = $before->{$name};
+        my $now = $after->{$name};
+        my $want = $asked->{$name};
+        next if defined $was && defined $now && $was eq $now
+             && !defined $want;
+        my $state;
+        if (defined $want) {
+            $asked_n++;
+            if (defined $now && $now == $want) { $state = 'took'; $took_n++ }
+            elsif (defined $was && defined $now && $was == $now) {
+                $state = "IGNORED (camera reports " . (defined $now ? $now : '?') . ")";
+            } else {
+                $state = 'rounded to ' . (defined $now ? $now : '?');
+            }
+        } else {
+            $state = 'moved on its own';
+        }
+        push @rows, sprintf('    %-30s %s -> %s%s  %s', $name,
+            defined $was ? $was : '?', defined $now ? $now : '?',
+            defined $want ? " (asked $want)" : '', $state);
+    }
+    my @when = localtime(time);
+    my $head = sprintf('%04d-%02d-%02d %02d:%02d:%02d  %s  %d/%d asked changes took',
+        $when[5] + 1900, $when[4] + 1, $when[3], $when[2], $when[1], $when[0],
+        $stage, $took_n, $asked_n);
+    push @rows, '    nothing moved' unless @rows;
+    if (open my $fh, '>>', $ADJUST_LOG) {
+        print {$fh} "$head\n", map { "$_\n" } @rows;
+        close $fh;
+    }
+    # A write that did not take is a failure, not a note.
+    meter_log("$stage: " . ($asked_n - $took_n) . ' of the values asked for '
+            . 'did not take - see ' . $ADJUST_LOG, always => 1)
+        if $asked_n > $took_n;
+    return;
+}
+
 # Send the given trim, worked out from the preset's own baseline. Returns the
 # number of controls actually written.
 #
@@ -1529,6 +1598,13 @@ sub meter_apply_trim {
                     . 'the first pass could not read it', always => 1);
         }
     }
+    # Every control the camera has, as it stands before anything is sent.
+    # Read in full rather than just the ones being trimmed: the exposure
+    # time and the focus move on their own when the light changes, and
+    # seeing that beside the values that were asked for is most of the use
+    # of keeping the record.
+    my %before = meter_read_all($dev);
+
     %meter_wrote = ();
     for my $ctrl (@trim_ctrls) {
         next unless defined $meter_base{$ctrl} && $ctrl_range{$ctrl};
@@ -1561,6 +1637,18 @@ sub meter_apply_trim {
 
     # The light just moved, so give the autofocus a fresh start on it.
     meter_refocus($dev);
+
+    # And the same controls again, afterwards. A moment first: a driver does
+    # not always report a new value the instant it is written, and reading
+    # too early would record a change that took as one that did not.
+    if (%before) {
+        select(undef, undef, undef, 0.4);
+        my %after = meter_read_all($dev);
+        my %asked = %meter_wrote;
+        $asked{sharpness} = $sharp if defined $sharp;
+        meter_track_adjustment(sprintf('light meter trim %+d', $trim),
+                               \%before, \%after, \%asked);
+    }
     return scalar keys %meter_wrote;
 }
 
