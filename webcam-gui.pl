@@ -140,7 +140,8 @@ my $span_label;
 my $container;
 
 my @panes;
-my $pane_holder = $live_page->Frame->pack(-side => 'top', -pady => 4);
+my $pane_holder = $live_page->Frame->pack(-side => 'top', -fill => 'both',
+                                          -expand => 1, -pady => 4);
 
 my $state_row = $live_page->Frame->pack(-side => 'top', -fill => 'x', -padx => 6);
 my $state_dot = $state_row->Label(-text => ' ', -background => '#555555',
@@ -164,6 +165,11 @@ $button_row->Button(-text => 'Free space now', -width => 15,
 $button_row->Button(-text => 'Open archive folder', -width => 18,
                     -command => \&on_open_folder)
            ->pack(-side => 'left', -padx => 2);
+# Detach the video into a window of its own - the phone-style pop-out.
+# Camera 1 by default; each pane also has its own button in its title bar.
+$button_row->Button(-text => 'Pop out video', -width => 14,
+                    -command => sub { pop_out(1) })
+           ->pack(-side => 'left', -padx => 12);
 
 # ---- the cameras ----
 #
@@ -279,6 +285,9 @@ my $disk_label = $live_page->Label(-text => '', -foreground => '#003366',
 
 sub build_panes {
     my ($count) = @_;
+    for my $old (@panes) {
+        eval { $old->{pop}{window}->destroy; 1 } if $old->{pop};
+    }
     $_->{holder}->destroy for grep { $_->{holder} } @panes;
     @panes = ();
     $count = 1 if $count < 1;
@@ -290,17 +299,28 @@ sub build_panes {
                                          -relief => 'sunken');
         $holder->grid(-row => int(($number - 1) / $shape->{across}),
                       -column => ($number - 1) % $shape->{across},
-                      -padx => 3, -pady => 3);
+                      -padx => 3, -pady => 3, -sticky => 'nsew');
+        # Every row and column pulls its share of the window, so the panes
+        # grow with it instead of sitting at their starting size in a field
+        # of grey.
+        $pane_holder->gridRowconfigure(
+            int(($number - 1) / $shape->{across}), -weight => 1);
+        $pane_holder->gridColumnconfigure(
+            ($number - 1) % $shape->{across}, -weight => 1);
         my $head = $holder->Frame->pack(-side => 'top', -fill => 'x');
         my $dot = $head->Label(-text => ' ', -background => '#555555',
                                -width => 2)->pack(-side => 'left');
         my $title = $head->Label(-text => "Camera $number",
                                  -font => 'Helvetica 9 bold')
                          ->pack(-side => 'left', -padx => 4);
+        $head->Button(-text => 'Pop out', -font => 'Helvetica 8',
+                      -padx => 4, -pady => 0,
+                      -command => sub { pop_out($number) })
+             ->pack(-side => 'right', -padx => 4);
         my $canvas = $holder->Canvas(
             -width => $shape->{width}, -height => $shape->{height},
             -background => '#101014', -highlightthickness => 0)
-            ->pack(-side => 'top');
+            ->pack(-side => 'top', -fill => 'both', -expand => 1);
         # One Photo per pane, read into over and over rather than a new Photo
         # every tenth of a second: a Photo that is replaced has to be deleted
         # or it stays in Tk's image table, and ten a second adds up fast.
@@ -324,13 +344,17 @@ sub build_panes {
         my $rec_text = $canvas->createText(34, 19, -anchor => 'w',
             -text => 'REC', -fill => '#ffffff',
             -font => 'Helvetica 11 bold', -state => 'hidden');
-        push @panes, {
+        my $pane = {
             rec_dot => $rec_dot, rec_text => $rec_text,
             index => $number, holder => $holder, canvas => $canvas,
             photo => $photo, image => $image_id, text => $text_id,
-            dot => $dot, title => $title, mtime => 0,
+            dot => $dot, title => $title, mtime => 0, pop => undef,
             width => $shape->{width}, height => $shape->{height},
         };
+        $canvas->Tk::bind('<Configure>',
+            [ sub { on_pane_resize($pane, $_[1], $_[2]) },
+              Tk::Ev('w'), Tk::Ev('h') ]);
+        push @panes, $pane;
     }
 
     fit_window();
@@ -344,6 +368,143 @@ sub build_panes {
         preview_height => $shape->{height},
     });
     $settings = WebcamRecord::read_settings();
+    return;
+}
+
+# ---- panes that follow the window, and the pop-out ----
+
+# Tk::Photo can only scale an image by whole-number subsampling, so a pane
+# bigger than the preview cannot be filled by stretching what arrived - which
+# is why this program has always had ffmpeg make the preview at exactly the
+# pane's size. Resizing the window therefore means telling the recorder a new
+# preview size, and that restarts ffmpeg: it is debounced by a second and a
+# half and ignores small changes, so one drag of the window edge costs one
+# restart rather than one per pixel.
+my $resize_pending;
+my ($want_w, $want_h) = (0, 0);
+
+sub on_pane_resize {
+    my ($pane, $width, $height) = @_;
+    return if !defined $width || $width < 20 || $height < 20;
+    $pane->{width}  = $width;
+    $pane->{height} = $height;
+    my $canvas = $pane->{canvas};
+    eval {
+        $canvas->coords($pane->{image}, $width / 2, $height / 2);
+        $canvas->coords($pane->{text},  $width / 2, $height / 2);
+        $canvas->itemconfigure($pane->{text},
+            -width => ($width > 120 ? $width - 40 : 80));
+        1;
+    };
+    return if $pane->{pop};        # a pop-out window drives its own size
+
+    my $current_w = int($settings->{preview_width}  || 640);
+    my $current_h = int($settings->{preview_height} || 360);
+    return if abs($width - $current_w) < 48 && abs($height - $current_h) < 48;
+    ($want_w, $want_h) = ($width, $height);
+    $mw->afterCancel($resize_pending) if $resize_pending;
+    $resize_pending = $mw->after(1500, \&apply_preview_size);
+    return;
+}
+
+sub apply_preview_size {
+    $resize_pending = undef;
+    return if $want_w < 160 || $want_h < 90;
+    WebcamRecord::write_settings({
+        preview_width  => $want_w,
+        preview_height => $want_h,
+    });
+    $settings = WebcamRecord::read_settings();
+    $recorder->{settings} = $settings;
+    # The new size only reaches the picture when ffmpeg is restarted with it.
+    $recorder->start($recorder->{recording}) if $recorder->is_running;
+    return;
+}
+
+# Detach one camera into a window of its own: the phone-style pop-out. A
+# small always-on-top window that can be dragged anywhere, resized, or left
+# over another program while the main window does something else. The pane it
+# came from says where the video went and offers it back; closing the pop-out
+# docks it again, so the video can never end up nowhere.
+sub pop_out {
+    my ($index) = @_;
+    my ($pane) = grep { $_->{index} == $index } @panes;
+    return if !$pane;
+    if ($pane->{pop}) {
+        eval { $pane->{pop}{window}->deiconify; $pane->{pop}{window}->raise; 1 }
+            or $pane->{pop} = undef;
+        return if $pane->{pop};
+    }
+
+    my $window = $mw->Toplevel;
+    $window->title("Camera $index - live video");
+    $window->geometry('640x400');
+    $window->minsize(240, 180);
+    eval { $window->attributes(-topmost => 1); 1 };
+
+    my $canvas = $window->Canvas(-background => '#101014',
+                                 -highlightthickness => 0)
+                        ->pack(-side => 'top', -fill => 'both', -expand => 1);
+    my $photo = $mw->Photo(-width => 640, -height => 360);
+    my $image_id = $canvas->createImage(320, 180, -image => $photo);
+    my $text_id  = $canvas->createText(320, 180, -fill => '#99aabb',
+        -justify => 'center', -width => 560,
+        -text => 'waiting for the first frame...');
+    my $rec_dot = $canvas->createOval(12, 12, 26, 26, -fill => '#dd1111',
+        -outline => '#ffffff', -state => 'hidden');
+    my $rec_text = $canvas->createText(34, 19, -anchor => 'w', -text => 'REC',
+        -fill => '#ffffff', -font => 'Helvetica 11 bold', -state => 'hidden');
+
+    my $bar = $window->Frame->pack(-side => 'bottom', -fill => 'x');
+    my $on_top = 1;
+    $bar->Checkbutton(-text => 'Always on top', -variable => \$on_top,
+                      -command => sub {
+                          eval { $window->attributes(-topmost => $on_top); 1 };
+                      })->pack(-side => 'left', -padx => 6);
+    $bar->Button(-text => 'Pop in', -width => 10,
+                 -command => sub { pop_in($index) })
+        ->pack(-side => 'right', -padx => 6, -pady => 2);
+
+    my $pop = {
+        window => $window, canvas => $canvas, photo => $photo,
+        image => $image_id, text => $text_id, rec_dot => $rec_dot,
+        rec_text => $rec_text, width => 640, height => 360,
+    };
+    $canvas->Tk::bind('<Configure>',
+        [ sub {
+              my (undef, $w, $h) = @_;
+              return if !defined $w || $w < 20 || $h < 20;
+              $pop->{width} = $w; $pop->{height} = $h;
+              eval {
+                  $canvas->coords($image_id, $w / 2, $h / 2);
+                  $canvas->coords($text_id,  $w / 2, $h / 2);
+                  1;
+              };
+          }, Tk::Ev('w'), Tk::Ev('h') ]);
+    $canvas->Tk::bind('<Double-Button-1>', sub { pop_in($index) });
+    $window->protocol('WM_DELETE_WINDOW', sub { pop_in($index) });
+
+    $pane->{pop}   = $pop;
+    $pane->{mtime} = 0;
+    $pane->{canvas}->itemconfigure($pane->{text},
+        -text => "Camera $index is playing in its own window.\n"
+               . 'Close that window, or press Pop in, to bring it back here.');
+    return;
+}
+
+sub pop_in {
+    my ($index) = @_;
+    my ($pane) = grep { $_->{index} == $index } @panes;
+    return if !$pane || !$pane->{pop};
+    eval { $pane->{pop}{photo}->delete; 1 };
+    eval { $pane->{pop}{window}->destroy; 1 };
+    $pane->{pop}   = undef;
+    $pane->{mtime} = 0;            # the next frame redraws the pane
+    eval {
+        $pane->{canvas}->itemconfigure($pane->{text},
+            -text => 'waiting for the next frame...');
+        1;
+    };
     return;
 }
 
@@ -522,10 +683,13 @@ sub draw_into {
     return 0 if !-f $path;
     my $mtime = (stat $path)[9];
     return 0 if !$mtime || $mtime <= $pane->{mtime};
-    my $ok = eval { $pane->{photo}->read($path, -shrink => 1); 1 };
+    # A popped-out camera is drawn in its own window instead of its pane -
+    # one read either way, never both.
+    my $target = $pane->{pop} || $pane;
+    my $ok = eval { $target->{photo}->read($path, -shrink => 1); 1 };
     return 0 if !$ok;
     $pane->{mtime} = $mtime;
-    $pane->{canvas}->itemconfigure($pane->{text}, -text => '');
+    eval { $target->{canvas}->itemconfigure($target->{text}, -text => ''); 1 };
     return 1;
 }
 
@@ -561,18 +725,25 @@ sub status_tick {
           :                                  '#555555');
         # Recording AND a picture arriving: either alone is not recording.
         my $marked = ($row->{recording} && !$stale) ? 'normal' : 'hidden';
-        $pane->{canvas}->itemconfigure($pane->{$_}, -state => $marked)
-            for qw(rec_dot rec_text);
+        for my $target ($pane, $pane->{pop}) {
+            next if !$target;
+            eval {
+                $target->{canvas}->itemconfigure($target->{$_},
+                    -state => $marked) for qw(rec_dot rec_text);
+                1;
+            };
+        }
         $pane->{title}->configure(-text => sprintf('Camera %d%s%s',
             $pane->{index},
             ($row->{device} ? "  $row->{device}" : ''),
             ($row->{gigabytes} ? sprintf('  %.1f GB', $row->{gigabytes}) : '')));
+        my $shown = $pane->{pop} || $pane;
         if ($stale && $row->{error}) {
-            $pane->{canvas}->itemconfigure($pane->{text},
+            $shown->{canvas}->itemconfigure($shown->{text},
                 -text => substr($row->{error}, 0, 300));
         }
         elsif ($stale && $row->{retry_in}) {
-            $pane->{canvas}->itemconfigure($pane->{text},
+            $shown->{canvas}->itemconfigure($shown->{text},
                 -text => "camera lost - retrying in $row->{retry_in}s");
         }
     }
