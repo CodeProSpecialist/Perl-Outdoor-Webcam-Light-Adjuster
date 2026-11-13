@@ -85,28 +85,47 @@ sub ensure {
     my @missing_programs =
         grep { !_have_program($_) } sort keys %APT_FOR_PROGRAM;
 
-    if (!@missing) {
-        if (@missing_programs) {
-            my @packages =
-                _unique(map { $APT_FOR_PROGRAM{$_} } @missing_programs);
-            my $it = @missing_programs == 1 ? 'it' : 'them';
-            warn "webcam: not installed: @missing_programs - the schedule "
-               . "runs without $it, the automatic light adjustment does "
-               . "not. To add $it: " . _apt_command(@packages) . "\n";
-        }
+    return if !@missing && !@missing_programs;
+
+    # A missing program is installed here too, not merely reported. ffmpeg is
+    # the one that matters: without it there is no recording at all, so a
+    # first run on a clean machine should fix that itself rather than hand
+    # back an apt command. On a terminal it offers to install, exactly as it
+    # does for a Perl module. Headless, and with the Perl modules all
+    # present, it keeps the old behaviour and warns rather than exiting: a
+    # cron job that still does something useful is better than one that dies.
+    if (!@missing && !_interactive()) {
+        my @packages =
+            _unique(map { $APT_FOR_PROGRAM{$_} } @missing_programs);
+        my $it = @missing_programs == 1 ? 'it' : 'them';
+        my %why = ('ffmpeg'   => 'there is no recording without ffmpeg',
+                   'v4l2-ctl' => 'the automatic light adjustment needs '
+                               . 'v4l2-ctl');
+        my $why = join ' and ', map { $why{$_} } grep { $why{$_} }
+                                @missing_programs;
+        warn "webcam: not installed: @missing_programs - $why. "
+           . "To add $it: " . _apt_command(@packages) . "\n";
         return;
     }
 
     my @packages = _unique(
-        map { $APT_FOR{$_} || () } @missing
+        (map { $APT_FOR{$_} || () } @missing),
+        (map { $APT_FOR_PROGRAM{$_} } @missing_programs),
     );
 
     my @unknown = grep { !$APT_FOR{$_} } @missing;
 
     print "\n";
-    print "webcam: these Perl modules are needed and not installed:\n";
-    print "  $_\n" for @missing;
-    print "\n";
+    if (@missing) {
+        print "webcam: these Perl modules are needed and not installed:\n";
+        print "  $_\n" for @missing;
+        print "\n";
+    }
+    if (@missing_programs) {
+        print "webcam: these programs are needed and not installed:\n";
+        print "  $_\n" for @missing_programs;
+        print "\n";
+    }
 
     if (@unknown) {
         print "No apt package is known here for: @unknown\n";
@@ -157,9 +176,10 @@ sub ensure {
     # because the alternative is the original "Can't locate" error two lines
     # later, now with an apt run in front of it confusing the picture.
     my @still_missing = grep { _module_missing($_) } @missing;
+    push @still_missing, grep { !_have_program($_) } @missing_programs;
 
     if (@still_missing) {
-        print "\napt finished, but these still will not load:\n";
+        print "\napt finished, but these still are not there:\n";
         print "  $_\n" for @still_missing;
         print "\nThat means the package named above does not provide them on "
             . "this release.\n\n";

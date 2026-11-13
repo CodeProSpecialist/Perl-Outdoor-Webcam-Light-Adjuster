@@ -93,7 +93,10 @@ runs.
 
 What they check for: `perl-tk`, `v4l-utils`, `ffmpeg` and ImageMagick, plus
 python3 with TensorFlow and OpenCV for the brain, which is the one part of
-this repository that is not Perl.
+this repository that is not Perl. `ffmpeg` is the one recording cannot do
+without, so a start on a machine that has no ffmpeg offers to install it
+there and then rather than printing a command to paste. It comes from apt,
+not CPAN or pip.
 
 ```
 git clone https://github.com/CodeProSpecialist/Perl-Outdoor-Webcam-Light-Adjuster.git
