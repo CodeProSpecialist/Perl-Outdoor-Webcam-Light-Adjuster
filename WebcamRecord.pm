@@ -81,13 +81,23 @@ our %DEFAULTS = (
     keep_free_gb        => 25,
     max_archive_gb      => 250,
     archive_dir         => $ARCHIVE_DIR,
-    encoder             => 'h264',    # or 'copy': the camera's own mjpeg,
-                                      # no CPU, about four times the disk
+    encoder             => 'copy',    # the default, and the reason the
+                                      # recorder is cheap: 'copy' writes the
+                                      # camera's own mjpeg frames straight to
+                                      # disk, so nothing is encoded at all.
+                                      # 'h264' re-encodes to about a quarter
+                                      # the disk and costs a core per camera.
     crf                 => 23,
     still_every_seconds => 60,
-    preview_fps         => 10,
+    preview_fps         => 4,         # four a second reads as live to an eye
+                                      # watching a driveway, and each frame
+                                      # skipped is a decode and an encode not
+                                      # paid for
     preview_width       => 640,       # what the panes draw at; the archive
     preview_height      => 360,       # always keeps the full size
+    defaults_version    => 2,         # bumped when a default changes in a
+                                      # way that should reach a conf file
+                                      # already on disk
 );
 
 # ---- the settings file ----
@@ -98,15 +108,28 @@ our %DEFAULTS = (
 
 sub read_settings {
     my %settings = %DEFAULTS;
+    my $seen_file = 0;
+    my $seen_version = 0;
     if (open my $fh, '<', $CONF_FILE) {
+        $seen_file = 1;
         while (my $line = <$fh>) {
             chomp $line;
             next if $line =~ /^\s*(?:#|$)/;
             my ($key, $value) = $line =~ /^\s*([a-z_]+)\s*=\s*(.*?)\s*$/;
             next if !defined $key || !exists $settings{$key};
+            $seen_version = int($value || 0) if $key eq 'defaults_version';
             $settings{$key} = $value;
         }
         close $fh;
+    }
+    # The cheap-recording defaults arrived after this conf format did, so a
+    # conf written before them still says h264 and a ten-a-second preview -
+    # the expensive combination those defaults exist to avoid. A conf from
+    # before that change is brought forward once, and marked, so a later
+    # deliberate choice of h264 is left alone.
+    if ($seen_file && $seen_version < 2) {
+        $settings{$_} = $DEFAULTS{$_}
+            for qw(encoder preview_fps preview_width defaults_version);
     }
     $settings{cameras} = join ',', cameras_of(\%settings);
     return \%settings;
@@ -287,9 +310,14 @@ sub build_command {
     if ($record) {
         my $folder = camera_folder($settings, $index);
         File::Path::make_path($folder) if !-d $folder;
+        # A raw-only camera cannot be copied - there is nothing in the
+        # stream worth keeping as-is - so it is encoded even when copy was
+        # asked for. In that case ultrafast, because the point of asking for
+        # copy was to not spend a core on this.
+        my $preset = $settings->{encoder} eq 'copy' ? 'ultrafast' : 'veryfast';
         my @video = ($settings->{encoder} eq 'copy' && $input_format eq 'mjpeg')
             ? ('-c:v', 'copy')
-            : ('-c:v', 'libx264', '-preset', 'veryfast',
+            : ('-c:v', 'libx264', '-preset', $preset,
                '-crf', int($settings->{crf}), '-pix_fmt', 'yuv420p',
                '-g', $fps * 2);
         push @cmd, '-map', '0:v', @video, '-an',
@@ -323,7 +351,7 @@ sub build_command {
     my $pw = int($settings->{preview_width}  || 640);
     my $ph = int($settings->{preview_height} || 360);
     push @cmd, '-map', '0:v',
-        '-vf', 'fps=' . int($settings->{preview_fps} || 10)
+        '-vf', 'fps=' . int($settings->{preview_fps} || 4)
                . ',scale=' . $pw . ':' . $ph,
         '-update', '1', '-f', 'image2', _image2_atomic(),
         preview_file($index);

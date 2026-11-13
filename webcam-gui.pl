@@ -255,8 +255,8 @@ $rec_box->Spinbox(-from => 1, -to => 2000, -width => 7,
         ->grid(-row => 1, -column => 3, -sticky => 'w', -padx => 4);
 $rec_box->Label(-text => 'Video')->grid(-row => 1, -column => 4, -sticky => 'e');
 $rec_box->Optionmenu(
-    -options => [ [ 'h264  (small files, some CPU)'       => 'h264' ],
-                  [ 'copy  (camera mjpeg, no CPU, ~4x disk)' => 'copy' ] ],
+    -options => [ [ 'copy  (no CPU, ~4x disk)  - default'     => 'copy' ],
+                  [ 'h264  (small files, a core per camera)' => 'h264' ] ],
     -variable => \$encoder_var, -width => 30)
         ->grid(-row => 1, -column => 5, -sticky => 'w', -padx => 4);
 $rec_box->Button(-text => 'Apply', -width => 10, -command => \&apply_settings)
