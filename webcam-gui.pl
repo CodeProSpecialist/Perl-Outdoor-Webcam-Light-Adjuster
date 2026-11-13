@@ -168,8 +168,7 @@ $button_row->Button(-text => 'Free space now', -width => 15,
                     -command => \&on_janitor)
            ->pack(-side => 'left', -padx => 12);
 $button_row->Button(-text => 'Open archive folder', -width => 18,
-                    -command => sub { run_detached('xdg-open',
-                                      $settings->{archive_dir}) })
+                    -command => \&on_open_folder)
            ->pack(-side => 'left', -padx => 2);
 
 # ---- the cameras ----
@@ -412,6 +411,98 @@ sub on_rescan_devices {
         $slot->{picker}->configure(
             -options => [ map { [ $_->{label} => $_->{device} ] } @$devices ]);
     }
+    return;
+}
+
+# ---- the archive folder, and the state that has to agree with it ----
+#
+# ~/.cache/webcam holds the recorder pid, the status files and the preview
+# PPMs, and those still name segments the archive folder used to hold. Delete
+# an archive by hand and the recorder keeps writing against state that no
+# longer matches the disk, which shows up as a camera that will not record.
+# So opening the folder says so, and offers the one repair that fixes it.
+sub on_open_folder {
+    run_detached('xdg-open', $settings->{archive_dir});
+    show_archive_notice();
+    return;
+}
+
+sub show_archive_notice {
+    my $window = $mw->Toplevel(-title => 'Archive folder');
+    my $frame  = $window->Frame(-padx => 12, -pady => 12)
+                        ->pack(-fill => 'both', -expand => 1);
+
+    $frame->Label(-text => $settings->{archive_dir},
+                  -font => 'Helvetica 9 bold',
+                  -anchor => 'w', -justify => 'left')->pack(-fill => 'x');
+    $frame->Label(
+        -text => 'If the archive file is deleted, then the files in '
+               . '~/.cache/webcam related to that archive need to also be '
+               . 'deleted and the program needs to be restarted to begin '
+               . 'recording onto a new archive.',
+        -wraplength => 430, -justify => 'left', -anchor => 'w',
+        -pady => 8)->pack(-fill => 'x');
+
+    $frame->Button(
+        -text => 'Delete Archive files to fix camera not recording errors',
+        -command => sub { on_clear_state($window) })->pack(-fill => 'x',
+                                                           -pady => 4);
+    $frame->Button(-text => 'Close', -width => 10,
+                   -command => sub { $window->destroy })->pack(-pady => 2);
+    return;
+}
+
+# Empty $STATE_DIR. Nothing in there is recorded video - it is the pid file,
+# the status files and the preview PPMs, all of which the recorder writes
+# again on its next start. The recorder is stopped first so that it is not
+# holding a pid file that is about to disappear.
+sub on_clear_state {
+    my ($window) = @_;
+    my $state = $WebcamRecord::STATE_DIR;
+
+    my $answer = $mw->messageBox(
+        -title => 'Delete archive state files', -type => 'YesNo',
+        -icon => 'question',
+        -message => "Delete the recorder state files in $state?\n\n"
+                  . 'No recorded video is touched. Recording stops, and the '
+                  . 'program needs restarting afterwards to begin a new '
+                  . 'archive.');
+    return if lc($answer) ne 'yes';
+
+    eval { $recorder->stop; 1 };          # already stopped is fine
+
+    my (@failed, $removed);
+    $removed = 0;
+    if (opendir my $dir, $state) {
+        my @names = sort grep { $_ ne '.' && $_ ne '..' } readdir $dir;
+        closedir $dir;
+        for my $name (@names) {
+            my $path = "$state/$name";
+            my $ok = eval {
+                if (-d $path && !-l $path) { File::Path::remove_tree($path) }
+                else                       { unlink $path or die "$!\n" }
+                1;
+            };
+            if ($ok) { $removed++ }
+            else     { push @failed, "$name: $@" }
+        }
+    }
+    else {
+        $mw->messageBox(-title => 'Delete archive state files', -type => 'OK',
+                        -icon => 'info', -message => "$state\n\n$!");
+        return;
+    }
+
+    $state_text->configure(-text => 'state cleared - restart the program');
+    $state_dot->configure(-background => '#555555');
+    $window->destroy if $window;
+
+    my $note = "$removed item(s) deleted from $state.\n\n"
+             . 'Now close and restart the program to begin recording onto a '
+             . 'new archive.';
+    $note .= "\n\nCould not delete:\n" . join('', @failed) if @failed;
+    $mw->messageBox(-title => 'Delete archive state files', -type => 'OK',
+                    -icon => 'info', -message => $note);
     return;
 }
 
