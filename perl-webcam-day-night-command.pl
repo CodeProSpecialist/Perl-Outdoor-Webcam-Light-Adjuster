@@ -834,7 +834,13 @@ my @snap_guess = (
 # writes, and a loop that acts faster than its own feedback arrives will
 # oscillate - the picture breathes in and out all night instead of settling.
 # Ten seconds of patience is what buys the settling.
-my $METER_EVERY  = 30;
+# Every 10 seconds. The light at dusk moves faster than a half-minute check
+# can follow, and looking is cheap: a mean and two clipping figures off a
+# still the recorder already wrote, with nothing captured and the camera not
+# touched. The trim is still rate-limited by the settle time and the dead
+# band, so looking every 10 seconds means noticing sooner, not moving the
+# controls oftener.
+my $METER_EVERY  = 10;
 my $METER_SETTLE = 1;
 
 # What a good picture looks like, as numbers.
