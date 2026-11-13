@@ -272,8 +272,9 @@ my @snap_guess = (
     # starting over with nothing to measure.
     meter_home_dir() . '/Pictures/onn-webcam/program-snapshots-for-auto-adjust-picture',
     meter_home_dir() . '/webcam-snapshots',
-    meter_home_dir() . '/.xeoma/snapshots',
-    '/opt/Xeoma/snapshots',
+    # Where this program's own recorder puts the stills for cameras 2 to 4,
+    # for an installation whose camera 1 is not the one being measured.
+    $SNAP_DEFAULT . '/cam2',
     '/tmp/webcam-snapshots',
 );
 
@@ -2640,7 +2641,23 @@ sub build_terminal {
 
 # ---- The window ----
 
-my $mw = MainWindow->new(-title => 'Webcam Settings');
+# --embed <window id> puts this window inside another program's frame rather
+# than giving it one of its own. That is how webcam-main.pl shows this page in
+# its Settings tab: X11 lets a top-level window be created inside a frame that
+# asked to be a container, and -use is the end of that arrangement this side
+# holds. Run without it - which is every ordinary run, and still the way to
+# use this on its own - nothing below changes at all.
+my $embed_into;
+for my $index (0 .. $#ARGV) {
+    next if $ARGV[$index] ne '--embed';
+    $embed_into = $ARGV[$index + 1];
+    splice @ARGV, $index, 2;
+    last;
+}
+
+my $mw = $embed_into
+       ? MainWindow->new(-use => $embed_into, -title => 'Webcam Settings')
+       : MainWindow->new(-title => 'Webcam Settings');
 
 $mw->Label(-text => 'Webcam Controls', -font => 'Helvetica 13 bold')->pack(-pady => 4);
 
