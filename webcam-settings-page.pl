@@ -2642,7 +2642,7 @@ sub build_terminal {
 # ---- The window ----
 
 # --embed <window id> puts this window inside another program's frame rather
-# than giving it one of its own. That is how webcam-main.pl shows this page in
+# than giving it one of its own. That is how webcam-gui.pl shows this page in
 # its Settings tab: X11 lets a top-level window be created inside a frame that
 # asked to be a container, and -use is the end of that arrangement this side
 # holds. Run without it - which is every ordinary run, and still the way to

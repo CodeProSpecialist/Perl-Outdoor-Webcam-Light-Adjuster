@@ -16,7 +16,7 @@ trained on your own camera.
 ![The live video page: four camera panes, each with a REC mark while it is recording, above the camera slots and the recording settings](docs/live-video-page.png)
 
 ```
-perl webcam-main.pl
+perl webcam-gui.pl
 ```
 
 That is the whole start-up. It opens recording.
@@ -98,7 +98,7 @@ this repository that is not Perl.
 ```
 git clone https://github.com/CodeProSpecialist/Perl-Outdoor-Webcam-Light-Adjuster.git
 cd Perl-Outdoor-Webcam-Light-Adjuster
-perl webcam-main.pl
+perl webcam-gui.pl
 ```
 
 Everything the recorder and the archive do is core perl plus ffmpeg. There is
@@ -329,9 +329,11 @@ it reads every control off the camera, probes the brain and starts the
 scheduler's terminal - a second or two that should not sit in front of the
 video.
 
-`perl webcam-GUI.pl` still opens it on its own, exactly as before.
+`perl webcam-settings-page.pl` still opens it on its own, exactly as it did
+when it was the whole program.
 
-The settings page is the real `webcam-GUI.pl`, running as its own process and
+The settings page is the real `webcam-settings-page.pl`, running as its own
+process and
 drawn inside the tab: X11 lets a top-level window be created inside a frame
 that asked to be a container, which is what `--embed` does. Some window
 managers refuse that, so if the tab comes up empty there is a button under it
@@ -364,7 +366,8 @@ refused by the driver rather than clamped by it, and silently refused at that.
 
 ## Automatic light adjustment
 
-On top of the presets, the light meter in `webcam-GUI.pl` measures the picture the camera
+On top of the presets, the light meter in `webcam-settings-page.pl`
+measures the picture the camera
 is actually producing, from the stills in the snapshot folder, and nudges the
 controls to improve it - enhancing the preset rather than replacing it.
 
@@ -517,11 +520,11 @@ other's files.
 
 | File | What it is |
 |---|---|
-| `webcam-main.pl` | the main window: live video, archive, settings |
+| `webcam-gui.pl` | the main window: live video, archive, settings |
 | `WebcamRecord.pm` | the recorder and the janitor |
 | `WebcamArchive.pm` | the segment index, searching, playback and clip export |
 | `webcam-record.pl` | the headless CLI over both modules |
-| `webcam-GUI.pl` | the settings page, and still a program on its own |
+| `webcam-settings-page.pl` | the settings page, and still a program on its own |
 | `webcam-preset.pl` | the preset engine, with every value clamped |
 | `perl-webcam-day-night-command.pl` | the schedule |
 | `WebcamEnhance.pm` | the Perl side of the image correction |

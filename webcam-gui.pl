@@ -26,10 +26,10 @@ use strict;
 # archive's own cap, and the oldest footage is recycled rather than the disk
 # filling up. Preview only is one press away for when a camera is being aimed.
 #
-#     perl webcam-main.pl
+#     perl webcam-gui.pl
 #
-# The old entry point still works: perl webcam-GUI.pl opens the settings page
-# on its own, exactly as before.
+# The settings page still runs on its own: perl webcam-settings-page.pl opens
+# it in a window of its own, exactly as it did when it was the whole program.
 
 # First run: check the modules this script needs are installed, and offer to
 # install the apt packages that provide them if they are not. This has to
@@ -1029,7 +1029,7 @@ sub on_export {
 # the settings page
 # ======================================================================
 #
-# The settings window is webcam-GUI.pl, which is a script with its own
+# The settings window is webcam-settings-page.pl, a script with its own
 # MainWindow rather than something that can be packed into a frame here. X11
 # can still put it in this tab: a Frame asked for with -container holds
 # another program's top-level window, and that program creates its window with
@@ -1048,7 +1048,7 @@ my $settings_note;
 sub gui_script {
     my $here = File::Basename::dirname(Cwd::abs_path(__FILE__));
     for my $folder ($here, ($ENV{HOME} || ()), '.') {
-        my $path = "$folder/webcam-GUI.pl";
+        my $path = "$folder/webcam-settings-page.pl";
         return $path if -f $path;
     }
     return undef;
@@ -1059,9 +1059,9 @@ sub open_settings {
     my $script = gui_script();
     if (!$script) {
         $settings_note->configure(
-            -text => 'webcam-GUI.pl is not next to this file, in $HOME, or in '
-                   . 'the working directory, so the settings page cannot be '
-                   . 'opened.');
+            -text => 'webcam-settings-page.pl is not next to this file, in '
+                   . '$HOME, or in the working directory, so the settings '
+                   . 'page cannot be opened.');
         return;
     }
     my @cmd = ($^X, $script);
