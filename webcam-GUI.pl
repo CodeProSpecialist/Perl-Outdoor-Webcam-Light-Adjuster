@@ -2023,7 +2023,11 @@ sub draw_compare_frames {
         $status_tile{caption}{$name}->configure(-text => $caption);
 
         unless (length $path && -f $path) {
-            $label->configure(-image => undef, -text => '(not written yet)',
+            # The crop pair is only written when something was found, so an
+            # empty one is an ordinary quiet night, not a failure.
+            my $blank = $name =~ /^crop-/ ? '(nothing found to crop yet)'
+                                          : '(not written yet)';
+            $label->configure(-image => undef, -text => $blank,
                               -fg => '#888');
             delete $status_tile{photo}{$name};
             next;
@@ -2050,7 +2054,8 @@ sub draw_compare_frames {
 
     if ($shown) {
         $status_tile{note}->configure(
-            -text => (length $note ? $note : "$shown of 4 frames shown"),
+            -text => (length $note ? $note
+                                   : "$shown of 6 frames shown"),
             -fg => '#036');
     } else {
         $status_tile{note}->configure(
@@ -2458,6 +2463,76 @@ for my $p (@presets) {
     $col++;
 }
 $preset_status->grid(-row => $r2++, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 6);
+
+# ---- The light on the front of the camera ----
+#
+# Most webcams will not let software near it: the privacy LED is often wired
+# to the sensor's power rail, and on those nothing here can turn it off. So
+# this reports what the camera did rather than what it was told - the helper
+# sets the control and then reads it back - and says plainly when the answer
+# is no. A button that silently does nothing is worse than one that says it
+# cannot.
+my $led_status;
+my (@led_buttons);
+
+sub led_helper_run {
+    my ($flag) = @_;
+    my $helper = helper_beside('webcam_led.py');
+    return (0, 'webcam_led.py is not here beside this script') unless $helper;
+    my $quoted = $helper;
+    $quoted =~ s/(['\\])/\\$1/g;
+    # The one the rest of this window talks to, so the LED and the controls
+    # can never end up aimed at two different cameras.
+    my $node = $device;
+    $node =~ s/(['\\])/\\$1/g;
+    my $line = '';
+    if (open my $fh, '-|', "python3 '$quoted' $flag --device '$node' 2>&1") {
+        $line = <$fh> // '';
+        close $fh;
+    }
+    chomp $line;
+    return (0, 'the helper printed nothing - is python3 installed?')
+        unless length $line;
+    my ($ok, $text) = split /\|/, $line, 2;
+    return ($ok ? 1 : 0, defined $text ? $text : $line);
+}
+
+sub refresh_led_status {
+    my ($ok, $text) = led_helper_run('--status');
+    $led_status->configure(-text => $text, -fg => $ok ? '#333' : '#840');
+    # A camera with no LED control keeps its buttons, greyed, rather than
+    # losing them - the row still answers "can I?" next time.
+    $_->configure(-state => $ok ? 'normal' : 'disabled') for @led_buttons;
+    return $ok;
+}
+
+sub set_led {
+    my ($mode) = @_;
+    $led_status->configure(-text => "asking the camera for LED $mode...",
+                           -fg => '#036');
+    $led_status->update;
+    my ($ok, $text) = led_helper_run($mode eq 'on' ? '--on' : '--off');
+    $led_status->configure(-text => $text, -fg => $ok ? '#0a7a2a' : '#a00');
+    return $ok;
+}
+
+my $led_row = $c2->Frame;
+$led_row->grid(-row => $r2++, -column => 0, -columnspan => 2,
+               -sticky => 'w', -padx => 6, -pady => 2);
+$led_row->Label(-text => 'Camera LED:', -font => 'Helvetica 9')
+    ->pack(-side => 'left');
+push @led_buttons, $led_row->Button(
+    -text => 'Turn the LED off', -font => 'Helvetica 8',
+    -command => sub { set_led('off') })->pack(-side => 'left', -padx => 3);
+push @led_buttons, $led_row->Button(
+    -text => 'LED on', -font => 'Helvetica 8',
+    -command => sub { set_led('on') })->pack(-side => 'left', -padx => 3);
+$led_status = $c2->Label(-text => 'reading the camera...', -anchor => 'w',
+                         -justify => 'left', -font => 'Helvetica 8',
+                         -wraplength => 310, -fg => '#333');
+$led_status->grid(-row => $r2++, -column => 0, -columnspan => 2,
+                  -sticky => 'w', -padx => 6);
+refresh_led_status();
 
 # ---- The light meter panel ----
 
