@@ -671,6 +671,11 @@ sub train_from_photos {
     return (0, "no pictures in $folder yet - the light meter fills it as it runs")
         unless @shots;
 
+    # No --preset, which the trainer reads as "all of them": this pretrains
+    # all five brains, one per lighting preset, from the same folder of clear
+    # photos. Training a single brain would write the old all-day folder, and
+    # that folder is not read once a preset is in force, so the work would be
+    # thrown away.
     my $out = `python3 @{[ shell_quote($trainer) ]} --photos @{[ shell_quote($folder) ]} --force 2>&1` || '';
     my @lines = grep { /\S/ } split /\n/, $out;
     my $note = @lines ? $lines[-1] : 'the trainer said nothing';
