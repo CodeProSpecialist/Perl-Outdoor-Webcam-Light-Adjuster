@@ -906,6 +906,19 @@ my @trim_ctrls = sort keys %trim_rule;
 # stills and can be deleted and redone, is where a gamma lift belongs.
 my @LOCKED_CTRLS = ('saturation', 'hue');
 my $GAMMA_CTRL   = 'gamma';
+
+# Night gamma is the camera's factory default and nothing else.
+#
+# Gamma is left at the factory default on purpose, day and night. Moved either
+# way it turns a night frame blurry and grainy - it is a midtone curve applied
+# to a frame whose midtones are mostly sensor noise, so lifting it lifts the
+# grain and lowering it crushes what little picture is there.
+#
+# So at night gamma is pinned: the preset writes the default, and this loop
+# puts it back whichever way it has moved. The daylight rule below is the one
+# this file shipped with - by day a gamma pulled DOWN is kept, since a lower
+# gamma holds the midtones of a frame that has midtones to hold.
+
 my @locked_have  = ();       # which of them this camera actually has
 my %locked_base  = ();       # and the values the preset gave them
 
@@ -1016,6 +1029,7 @@ sub meter_trim_floor {
 }
 
 my %ctrl_range;              # name => [min, max], read from the camera
+
 my %meter_base;              # the preset's own values, re-learnt automatically
 my %meter_wrote;             # what this loop last sent, to spot outside changes
 my $trim        = 0;
@@ -1046,7 +1060,10 @@ sub meter_learn_ranges {
         next unless $line =~ /^\s*(\w+)\s+0x[0-9a-f]+\s+\((?:int|bool|menu|intmenu)\)/i;
         my $name = $1;
         $seen{$name} = 1;
-        next unless exists $trim_rule{$name} || $name eq 'sharpness';
+        # gamma is not trimmed, but its range is needed: the night ceiling
+        # below is a fraction of it.
+        next unless exists $trim_rule{$name} || $name eq 'sharpness'
+                 || $name eq $GAMMA_CTRL;
         my ($min) = $line =~ /min=(-?\d+)/;
         my ($max) = $line =~ /max=(-?\d+)/;
         if (defined $min && defined $max && $max > $min) {
@@ -1653,10 +1670,19 @@ sub meter_guard_locked {
         my $now  = $have{$name};
         next unless defined $now;
         next if $now == $want;
+        if ($name eq $GAMMA_CTRL && meter_dark_preset()) {
+            # Night gamma is pinned to the factory default. Moved either way
+            # it is put back, and the baseline is never moved to where it
+            # drifted, so one nudge cannot become the new normal for the rest
+            # of the night.
+            system("v4l2-ctl -d $dev --set-ctrl $name=$want 2>/dev/null");
+            push @fixed, "$name $now -> $want (night, factory gamma)";
+            next;
+        }
         if ($name eq $GAMMA_CTRL && $now < $want) {
-            # Pulled down, not up. Allowed, and worth keeping: a lower gamma
-            # holds the midtones together. Take it as the new ceiling rather
-            # than undoing it.
+            # By day, pulled down rather than up. Allowed, and worth keeping:
+            # a lower gamma holds the midtones together. Take it as the new
+            # ceiling rather than undoing it.
             $locked_base{$name} = $now;
             next;
         }

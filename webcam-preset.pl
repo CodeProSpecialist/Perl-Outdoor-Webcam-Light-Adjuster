@@ -45,9 +45,13 @@ sub read_controls {
         my $name = $1;
         my ($min) = $line =~ /min=(-?\d+)/;
         my ($max) = $line =~ /max=(-?\d+)/;
+        # The driver's own default, kept because the daylight presets do not
+        # set gamma at all - they leave it wherever the camera starts, which
+        # is this value. That is what the night gamma is pinned to.
+        my ($def) = $line =~ /default=(-?\d+)/;
         # bool controls report no min/max
         ($min, $max) = (0, 1) unless defined $min && defined $max;
-        $ctl{$name} = { min => $min, max => $max };
+        $ctl{$name} = { min => $min, max => $max, default => $def };
     }
     return %ctl;
 }
@@ -102,27 +106,54 @@ my $DYN_FRAMERATE  = 1;
 # colour of the evening the preset exists to capture.
 my $COLD_WB = 2800;
 
+# ---------------------------------------------------------------------------
+# The night camera settings, measured on the camera itself rather than tuned
+# here, and the single source for the night rows in both value tables below.
+#
+# These are in the legacy 0-255 control scale, which is the scale they were
+# measured on (sharpness 250 of 255, gain at the top of the range). The
+# modern ONN camera has its own, much smaller ranges - sharpness 0-7,
+# contrast 0-95 - so the same numbers are mapped onto those ranges by
+# position within the range rather than copied as raw values, which is what
+# night_values() below does. Copied raw, sharpness 250 would clamp to 7 and
+# contrast 32 would mean a third of the range instead of an eighth: a
+# different picture on each camera.
+#
+# The aperture priority flag and the exposure are deliberately NOT here. Both
+# tables keep the exposure they already had, and $AE_MODE still owns the mode.
+my %NIGHT_CAMERA = (
+    sharpness => 250, brightness => 193, contrast => 32,
+    saturation => 32, gain => 255,
+);
+my $NIGHT_SCALE = 255;     # the control scale %NIGHT_CAMERA was measured on
+
+# Night settings do not take on this camera until day settings have been
+# written once first - the driver keeps the previous frame settings otherwise
+# and the night values never reach the sensor. So the night apply writes the
+# day row once, holds it, and goes to night: ONE flip, and the day picture is
+# held no longer than this many seconds.
+my $NIGHT_PRIME_HOLD = 4;
+
 # ---- Value tables ----
 # legacy: the numbers already tuned for the older camera, kept as they were.
 # modern: the numbers tuned for the ONN webcam.
 # Anything the camera does not have is skipped; everything is clamped.
 my %LEGACY = (
-    # Night was retuned to match the ONN settings, mapped onto this camera's
-    # 0-255 ranges rather than copied as raw numbers: brightness and gain to
-    # the top, the longest exposure the driver will take, backlight
-    # compensation on, and sharpness cut back. Heavy sharpening amplifies
-    # sensor noise in the dark, which is why the ONN night preset sits at 3 of
-    # 7 rather than near maximum; 109 of 255 is the same proportion. Set
-    # sharpness back to 250 here if you prefer the old look.
+    # Night is %NIGHT_CAMERA: the settings measured on the camera, in the
+    # 0-255 scale they were measured in, so they go in here unchanged. The
+    # exposure and the aperture priority flag are the ones this table always
+    # had and are deliberately untouched - only gain, brightness, contrast,
+    # saturation and sharpness come from the measurement.
     night => {
-        sharpness => 36, brightness => 140, contrast => 199, saturation => 30,
+        sharpness => 250, brightness => 193, contrast => 32, saturation => 32,
         gain => 255, exposure => 2047, aepri => 1,
         backlight_compensation => 0, zoom_absolute => 1,
     },
     # Colour noise is most of what makes a dark frame look muddy, so this
-    # trades colour for a cleaner, apparently brighter picture.
+    # trades colour for a cleaner, apparently brighter picture. Everything
+    # else is the night row; only the saturation differs.
     night_mono => {
-        sharpness => 36, brightness => 140, contrast => 199, saturation => 0,
+        sharpness => 250, brightness => 193, contrast => 32, saturation => 0,
         gain => 255, exposure => 2047, aepri => 1,
         backlight_compensation => 0, zoom_absolute => 1,
     },
@@ -180,14 +211,19 @@ my %MODERN = (
     # sharpness down to 1 because sharpening at this noise level crisps the
     # grain rather than the subject. Measured after: black point 1 of 255,
     # noise down by a third, and the car at 60 ft reads as a car.
+    # The five frame controls here are placeholders: night_values() replaces
+    # them at apply time with %NIGHT_CAMERA mapped onto this camera's own
+    # ranges. They are written out as the nominal ONN equivalents so the table
+    # still reads as a table, and so that a camera whose ranges cannot be read
+    # falls back to something sane rather than to nothing.
     night => {
-        sharpness => 1, brightness => 6, contrast => 50, saturation => 14,
-        gain => 100, exposure => 5000, aepri => 0,
+        sharpness => 7, brightness => 48, contrast => 12, saturation => 15,
+        gain => 255, exposure => 5000, aepri => 0,
         backlight_compensation => 0, zoom_absolute => 0,
     },
     night_mono => {
-        sharpness => 1, brightness => 6, contrast => 50, saturation => 0,
-        gain => 100, exposure => 5000, aepri => 0,
+        sharpness => 7, brightness => 48, contrast => 12, saturation => 0,
+        gain => 255, exposure => 5000, aepri => 0,
         backlight_compensation => 0, zoom_absolute => 0,
     },
     # Day and Golden AM are the camera's own default light settings, copied
@@ -216,6 +252,59 @@ my %MODERN = (
 );
 
 my $vals = $modern ? $MODERN{$preset} : $LEGACY{$preset};
+
+# ---- The night values, on whatever ranges this camera actually has ----
+#
+# The numbers were measured in the legacy 0-255 scale. On a legacy camera they
+# go through untouched. On the modern ONN camera, whose ranges are much
+# smaller and in one case signed, each one is placed at the same position
+# within the control's own min..max as it sat within 0..255 - so sharpness 250
+# of 255 becomes sharpness near the ONN maximum rather than a number 35 times
+# too large clamped down to it, and brightness 193 of 255 lands three quarters
+# of the way up a range that starts below zero.
+#
+# night_mono keeps its saturation 0: that preset exists to throw the colour
+# away, and the measurement is not about colour.
+sub night_values {
+    my %out;
+    for my $name (keys %NIGHT_CAMERA) {
+        my $value = $NIGHT_CAMERA{$name};
+        if ($preset eq 'night_mono' && $name eq 'saturation') {
+            $out{$name} = 0;
+            next;
+        }
+        my $span = $ctl{$name};
+        if (!defined $span) {
+            $out{$name} = $value;
+        } elsif ($span->{min} == 0 && $span->{max} == $NIGHT_SCALE) {
+            $out{$name} = $value;
+        } else {
+            $out{$name} = int(0.5 + $span->{min}
+                + ($span->{max} - $span->{min}) * ($value / $NIGHT_SCALE));
+        }
+    }
+    return %out;
+}
+
+# The gamma the daylight presets run at: the camera's own factory default.
+#
+# None of the preset rows set gamma - they leave it where the camera starts.
+# Night gets that same number, written explicitly rather than inherited,
+# because gamma moved either way turns a night frame blurry and grainy: it is
+# a midtone curve applied to a frame whose midtones are mostly sensor noise,
+# so lifting it lifts the grain and lowering it crushes what picture there is.
+sub day_gamma {
+    return undef unless exists $ctl{'gamma'};
+    my $want = $LEGACY{day}{gamma};
+    $want = $MODERN{day}{gamma} unless defined $want;
+    return defined $want ? $want : $ctl{'gamma'}{default};
+}
+
+if ($preset eq 'night' || $preset eq 'night_mono') {
+    # The night values are the measured ones, on this camera's scales.
+    my %measured = night_values();
+    $vals = { %$vals, %measured };
+}
 
 # ---- Applying ----
 sub clamp {
@@ -321,6 +410,24 @@ sleep(1);
 # to be sent here. It is what lets the driver trade frame rate for exposure.
 set_ctrl($aepri_ctrl, $DYN_FRAMERATE);
 
+# The one flip. Night settings do not take until the day settings have been
+# written once, so the day row goes on first, is held, and then night follows -
+# once, in that order, never back again. The hold is capped at
+# $NIGHT_PRIME_HOLD seconds, which is as long as the camera is allowed to sit
+# on a day picture in the dark.
+if ($preset eq 'night' || $preset eq 'night_mono') {
+    my $day = $modern ? $MODERN{day} : $LEGACY{day};
+    printf("  priming with the day settings for %ss so the night values "
+         . "will take\n", $NIGHT_PRIME_HOLD);
+    my $started = time();
+    for my $name (qw(sharpness brightness contrast saturation gain
+                     backlight_compensation)) {
+        set_ctrl($name, $day->{$name}) if defined $day->{$name};
+    }
+    my $held = time() - $started;
+    sleep($NIGHT_PRIME_HOLD - $held) if $held < $NIGHT_PRIME_HOLD;
+}
+
 set_ctrl('sharpness',              $vals->{sharpness});
 set_ctrl('brightness',             $vals->{brightness});
 set_ctrl('contrast',               $vals->{contrast});
@@ -328,6 +435,14 @@ set_ctrl('saturation',             $vals->{saturation});
 set_ctrl('gain',                   $vals->{gain});
 set_ctrl('backlight_compensation', $vals->{backlight_compensation})
     if defined $vals->{backlight_compensation};
+
+# Gamma, at night only, pinned to the value the daylight presets run at.
+# Without this it keeps whatever the last gamma lift left behind, and a gamma
+# raised once in the dark stays raised - which lifts the noise floor in the
+# stream the recorder is writing. Daylight rows leave gamma alone, as always.
+if ($preset eq 'night' || $preset eq 'night_mono') {
+    set_ctrl('gamma', day_gamma());
+}
 
 # Focus is set manually so the camera does not hunt in the dark.
 # Continuous autofocus, always, on every preset. Nothing here ever leaves the
