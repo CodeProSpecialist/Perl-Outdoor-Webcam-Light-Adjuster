@@ -1328,7 +1328,9 @@ sub build_brain_tile {
     $brain_tile{reset}->pack(-side => 'left');
     $row->Label(
         -text => 'If image is corrected too dark or incorrectly, delete and '
-               . 'retrain the machine learning model.',
+               . 'retrain the machine learning model. This takes only the '
+               . 'brain for the preset that is on now; the other brains are '
+               . 'left alone.',
         -font => 'Helvetica 8', -anchor => 'w', -justify => 'left',
         -wraplength => 420,
     )->pack(-side => 'left', -padx => 6);
@@ -1564,8 +1566,16 @@ sub on_reset_brain {
 
     $brain_tile{busy} = 1;
     $brain_tile{reset}->configure(-state => 'disabled');
+    # Name the brain rather than describing it: the button deletes exactly the
+    # one for the preset that is on and leaves the other four trained and
+    # intact, and this line is the only place that says so while it runs.
+    my $named = 'brain G';
+    if (enhance_module()) {
+        my ($family) = eval { WebcamEnhance::active_brain() };
+        $named = "brain $family" if defined $family && length $family;
+    }
     $brain_tile{status}->configure(
-        -text => 'deleting the brain and training a new one, this takes a minute...');
+        -text => "deleting $named and training a new one, this takes a minute...");
     my $log = '/tmp/.webcam-brain-retrain.log';
     unlink $log;
     $brain_tile{log} = $log;
