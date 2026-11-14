@@ -1503,8 +1503,187 @@ sub build_brain_tile {
     $text->bind('<Button-4>', sub { $text->yview('scroll', -3, 'units'); Tk->break });
     $text->bind('<Button-5>', sub { $text->yview('scroll',  3, 'units'); Tk->break });
 
+    build_brain_suite($frame);
     refresh_brain_tile();
     return $frame;
+}
+
+# ---- the suite: all five brains at a glance, under the terminal ----
+#
+# The terminal above says everything about one brain - the live one. That
+# leaves the obvious question unanswered: what about the other four. A brain
+# that never trained does not announce itself; the picture just comes out
+# worse under that one preset and nothing on the page says why. So every
+# brain gets a card with the same facts on it, and they sit side by side so
+# the odd one out shows up without having to be looked for.
+#
+# The five, in the order the light goes round the day, with the short word
+# each card is headed by. Fixed order on purpose: cards that moved about as
+# presets fired would be unreadable at a glance, which is the whole point.
+our @SUITE_BRAINS = (
+    ['golden_am',  'Golden AM'],
+    ['day',        'Day'],
+    ['bright_sun', 'Bright Sun'],
+    ['golden_pm',  'Golden PM'],
+    ['night',      'Night'],
+);
+our $SUITE_COLUMNS = 3;
+
+# The badge colours. Darker than the Python window's, because this page is
+# the system grey rather than a dark skin and the same greens would not be
+# readable on it.
+our %SUITE_STATE = (
+    ACTIVE     => '#0a7a2a',     # correcting the picture right now
+    TRAINED    => '#1a5fb4',     # on disk, ready, not the live one
+    PRETRAINED => '#8a6100',     # built from simulated light only
+    MISSING    => '#a00000',     # nothing on disk for this preset
+);
+
+our %brain_suite;
+
+sub build_brain_suite {
+    my ($parent) = @_;
+
+    my $frame = $parent->Frame(-borderwidth => 1, -relief => 'groove');
+    $frame->pack(-fill => 'x', -padx => 4, -pady => 4);
+    $brain_suite{frame} = $frame;
+
+    my $bar = $frame->Frame->pack(-fill => 'x', -padx => 6, -pady => 2);
+    $bar->Label(-text => 'BRAIN SUITE', -font => 'Helvetica 9 bold')
+        ->pack(-side => 'left');
+    $brain_suite{count} = $bar->Label(-text => '', -font => 'Helvetica 8');
+    $brain_suite{count}->pack(-side => 'right');
+
+    $brain_suite{note} = $frame->Label(
+        -text => 'reading the brains...', -anchor => 'w', -justify => 'left',
+        -font => 'Helvetica 8', -wraplength => 620);
+    $brain_suite{note}->pack(-fill => 'x', -padx => 6);
+
+    my $grid = $frame->Frame->pack(-fill => 'x', -padx => 4, -pady => 2);
+    my $index = 0;
+    for my $brain (@SUITE_BRAINS) {
+        my ($family, $title) = @$brain;
+        my $card = $grid->Frame(-borderwidth => 1, -relief => 'sunken');
+        $card->grid(-row => int($index / $SUITE_COLUMNS),
+                    -column => $index % $SUITE_COLUMNS,
+                    -sticky => 'nsew', -padx => 3, -pady => 3);
+        my $head = $card->Frame->pack(-fill => 'x', -padx => 5, -pady => 1);
+        $head->Label(-text => $title, -font => 'Helvetica 9 bold')
+             ->pack(-side => 'left');
+        my $state = $head->Label(-text => '...', -font => 'Helvetica 7 bold');
+        $state->pack(-side => 'right');
+        my $body = $card->Label(-text => '', -anchor => 'w',
+                                -justify => 'left', -font => 'Courier 8');
+        $body->pack(-fill => 'x', -padx => 5, -pady => 1);
+        $brain_suite{cards}{$family} = { state => $state, body => $body };
+        $index++;
+    }
+    for my $column (0 .. $SUITE_COLUMNS - 1) {
+        $grid->gridColumnconfigure($column, -weight => 1, -uniform => 'brain');
+    }
+    return $frame;
+}
+
+# (state, lines) for one brain, read off the disk every time.
+#
+# Nothing here loads a model: the meta file beside it carries every number
+# the card shows, and loading five Keras models to draw a summary would cost
+# seconds and a lot of memory for facts that are already written down. The
+# harvest is not on the card either, unlike the Python window's: asking for
+# it means running the trainer once per brain, which is five interpreters
+# started to fill in five lines.
+sub brain_suite_facts {
+    my ($family, $active) = @_;
+    return ('MISSING', ['WebcamEnhance.pm was not found'])
+        unless enhance_module();
+
+    my ($dir, $meta) = eval { WebcamEnhance::brain_meta($family) };
+    return ('MISSING', ['no brain on disk yet',
+                        'the analytic correct runs instead'])
+        unless defined $dir && length $dir;
+    $meta = {} unless ref $meta eq 'HASH';
+    return ('TRAINED', ['model.keras is there, meta.json is not',
+                        'so there is nothing to report on it'])
+        unless keys %$meta;
+
+    # What it was built from. A brain that has only ever seen simulated light
+    # is worth telling apart from one trained on this camera: both load and
+    # both correct, and only one of them knows this scene.
+    my $source = $meta->{trained_from};
+    $source = '' unless defined $source;
+    my $state = $source =~ /simul|synth/i ? 'PRETRAINED' : 'TRAINED';
+    $state = 'ACTIVE' if defined $active && length $active && $family eq $active;
+
+    my @lines;
+    if (my $samples = $meta->{pretrain_samples}) {
+        my $cap = $meta->{pretrain_cap} || $samples;
+        push @lines, sprintf('samples   %s / %s', commify($samples),
+                             commify($cap));
+    }
+    if (my $photos = $meta->{photos_trained_on}) {
+        push @lines, sprintf('photos    %s trained, %s held back',
+                             commify($photos),
+                             commify($meta->{photos_held_back} || 0));
+    }
+    my $loss = $meta->{val_loss};
+    my $flat = $meta->{flat_answer_val_loss};
+    if (defined $loss && $flat) {
+        push @lines, sprintf('val loss  %.5f  (%+.0f%% on flat)', $loss,
+                             ($flat - $loss) / $flat * 100);
+    }
+    elsif (defined $loss) {
+        push @lines, sprintf('val loss  %.5f', $loss);
+    }
+    push @lines, 'trained   ' . ($meta->{trained_at} || 'not recorded');
+    push @lines, 'built on  ' . (length $source ? $source : 'not recorded');
+    return ($state, \@lines);
+}
+
+# 20043 -> 20,043, so a sample count can be read at a glance.
+sub commify {
+    my ($number) = @_;
+    $number = 0 unless defined $number;
+    1 while $number =~ s/^(\d+)(\d{3})/$1,$2/;
+    return $number;
+}
+
+# Redraw every card. Called wherever the brain's details are.
+sub refresh_brain_suite {
+    return unless $brain_suite{cards};
+    my $active;
+    if (enhance_module()) {
+        ($active) = eval { WebcamEnhance::active_brain() };
+    }
+    my $ready = 0;
+    for my $brain (@SUITE_BRAINS) {
+        my ($family) = @$brain;
+        my $card = $brain_suite{cards}{$family} or next;
+        my ($state, $lines) = eval { brain_suite_facts($family, $active) };
+        unless (defined $state) {
+            my $why = $@ || 'could not read it';
+            $why =~ s/\s+at\s+\S+\s+line\s+\d+.*//s;
+            ($state, $lines) = ('MISSING', [$why]);
+        }
+        $ready++ unless $state eq 'MISSING';
+        $card->{state}->configure(-text => $state,
+                                  -fg => $SUITE_STATE{$state} || '#333333');
+        $card->{body}->configure(-text => join("\n", @$lines));
+    }
+    my $total = scalar @SUITE_BRAINS;
+    $brain_suite{count}->configure(-text => "$ready/$total");
+    my $note =
+        $ready == $total
+            ? 'All five brains are on disk. The one marked ACTIVE is '
+            . 'correcting the picture right now; the others wait for their '
+            . 'preset.'
+        : $ready
+            ? sprintf('%d of %d brains are missing. Under those presets the '
+                      . 'analytic correct does the work, which is weaker but '
+                      . 'never wrong.', $total - $ready, $total)
+            : 'No brains on disk. The analytic correct is doing all of the '
+            . 'work - train from the box above once the harvest is ready.';
+    $brain_suite{note}->configure(-text => $note);
+    return 1;
 }
 
 # One line saying what the two boxes add up to.
@@ -1771,6 +1950,9 @@ sub refresh_brain_tile {
     $brain_tile{text}->insert('end', $body);
     # Read-only: the program's output comes in, nothing is typed back.
     $brain_tile{text}->configure(-state => 'disabled');
+    # The cards read the same disk this text does, so they are redrawn
+    # together rather than on a timer of their own.
+    eval { refresh_brain_suite() };
     return 1;
 }
 

@@ -110,6 +110,29 @@ KEY_SAMPLE_STREAM = 'sample_the_stream'
 KEY_SAMPLE_SECONDS = 'sample_seconds'
 DEFAULT_SAMPLE_SECONDS = 300
 
+# Where the brain's training frames come from. Two switches, because the two
+# sources are not the same kind of thing and a camera that is held by the
+# recorder can only offer the first of them.
+#
+#   train_from_pictures - train on the snapshot folder, which is what the light
+#       meter has been filling all along: real frames of the real scene in the
+#       real light, which is the whole reason this brain beats a general one.
+#       This is the one to leave on.
+#
+#   train_from_camera - grab a short burst off the camera itself and train on
+#       that. Only possible while the camera is free: a V4L2 device lets one
+#       program stream at a time, so when the recording software holds it this
+#       finds nothing and says who has it rather than failing quietly.
+KEY_TRAIN_PICTURES = 'train_from_pictures'
+KEY_TRAIN_CAMERA = 'train_from_camera'
+
+# The burst taken off the camera when training direct from it: how many frames
+# and how far apart. Spread over a few seconds rather than grabbed back to
+# back, because twelve frames of one instant are one frame as far as training
+# is concerned.
+BURST_FRAMES = int(os.environ.get('WEBCAM_BURST_FRAMES', 12))
+BURST_SPACING = 0.75
+
 # How many consecutive stills to average, and how old the oldest of them may
 # be. The window matters: stills from twenty minutes apart are two different
 # scenes and averaging them smears one over the other. Three minutes at the
@@ -503,7 +526,8 @@ def read_settings():
     stills, and all of them are worth correcting: the daylight ones are not
     dark but they are flat, and the same stack-CLAHE-brain G chain is what
     the detector then has to work with. Correcting only at night left two
-    thirds of the day untouched.
+    thirds of the day untouched and made the corpus lopsided, because the
+    brain only ever saw the frames it had already been used on.
 
     Object detection starts on with it, since boosting a car or a person is
     the point of correcting the frame at all, and it is wanted in daylight
@@ -511,14 +535,15 @@ def read_settings():
 
     Stream sampling starts **off**, deliberately. The stills are the default
     source and they cost nothing: the recorder is writing them anyway. Going
-    to the camera directly means opening a device something else is usually
-    holding, so it stays opt-in.
+    to the camera directly means opening a device that something else is
+    usually holding, so it stays opt-in.
 
     A conf file written before any of these keys existed falls back to these
     same defaults for the keys it does not mention, so an old file means
     "corrected" rather than silently meaning "never corrected".
     """
     settings = {KEY_NIGHT: False, KEY_ALL_DAY: True, KEY_DETECT: True,
+                KEY_TRAIN_PICTURES: True, KEY_TRAIN_CAMERA: False,
                 KEY_SAMPLE_STREAM: False,
                 KEY_SAMPLE_SECONDS: DEFAULT_SAMPLE_SECONDS}
     try:
@@ -529,9 +554,9 @@ def read_settings():
                 key, _, value = line.partition('=')
                 key = key.strip()
                 if key == KEY_SAMPLE_SECONDS:
-                    # The one setting that is a number rather than a switch.
-                    # A bad value falls back to the default instead of
-                    # stopping the correction over a typo.
+                    # The one setting here that is a number rather than a
+                    # switch. A bad value falls back to the default instead
+                    # of stopping the correction over a typo.
                     try:
                         settings[key] = max(30, int(value.strip()))
                     except ValueError:
@@ -544,6 +569,7 @@ def read_settings():
 
 
 def write_settings(night=None, all_day=None, detect=None,
+                   train_pictures=None, train_camera=None,
                    sample_stream=None, sample_seconds=None):
     """Change any of the switches, leaving the others as they were."""
     settings = read_settings()
@@ -553,9 +579,15 @@ def write_settings(night=None, all_day=None, detect=None,
         settings[KEY_ALL_DAY] = bool(all_day)
     if detect is not None:
         settings[KEY_DETECT] = bool(detect)
+    if train_pictures is not None:
+        settings[KEY_TRAIN_PICTURES] = bool(train_pictures)
+    if train_camera is not None:
+        settings[KEY_TRAIN_CAMERA] = bool(train_camera)
     if sample_stream is not None:
         settings[KEY_SAMPLE_STREAM] = bool(sample_stream)
     if sample_seconds is not None:
+        # Floored rather than rejected: a one-second interval would mean
+        # fighting the recorder for the camera continuously.
         try:
             settings[KEY_SAMPLE_SECONDS] = max(30, int(sample_seconds))
         except (TypeError, ValueError):
@@ -566,6 +598,9 @@ def write_settings(night=None, all_day=None, detect=None,
             handle.write('#   night image CLAHE and ML auto correct\n')
             handle.write('#   24 hour image CLAHE and ML auto correct\n')
             handle.write('#   find cars and people and enhance them\n')
+            handle.write('# And where the brain trains from:\n')
+            handle.write('#   train the brain from the picture folder\n')
+            handle.write('#   train the brain direct from the detected webcamera\n')
             handle.write('# Optionally, as well as the stills:\n')
             handle.write('#   sample a frame off the camera stream, '
                          'and how often in seconds\n')
@@ -577,6 +612,171 @@ def write_settings(night=None, all_day=None, detect=None,
     except OSError:
         return False
     return True
+
+
+# ---- training direct from the camera ----
+#
+# The Perl side of these two repositories has the same three functions, writing
+# the same conf file and the same burst folder, so a box ticked in either
+# window means the same thing to both.
+
+def camera_training_dir():
+    """Where a burst off the camera is put.
+
+    Its own folder, not the picture folder: the light meter measures the newest
+    still in there and a burst of twelve would have it measuring frames nobody
+    asked for.
+    """
+    folder = os.environ.get(
+        'WEBCAM_CAMERA_TRAINING_DIR',
+        os.path.join(os.path.expanduser('~'), 'Pictures',
+                     'webcam-camera-training'))
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        return None
+    return folder
+
+
+def camera_holder(device):
+    """Who holds the camera, if anyone, as a string - or None.
+
+    This is the whole difficulty with training direct from the camera. A V4L2
+    device lets one program stream at a time, and on a machine that is
+    recording the recorder has it. Worse than failing would be succeeding at
+    the wrong moment: if the recorder drops and re-opens its stream just as a
+    grab lands, the grab wins and the recorder does not come back. So when
+    anything else holds the device, nothing is sent to it.
+    """
+    if not device or not os.path.exists(device):
+        return None
+    mine = os.getpid()
+
+    if shutil.which('fuser'):
+        try:
+            done = subprocess.run(['fuser', '-v', device], capture_output=True,
+                                  text=True, timeout=5)
+            names = set()
+            for line in (done.stdout + done.stderr).splitlines():
+                parts = line.split()
+                # fuser -v lines look like:  USER  PID  ACCESS  COMMAND
+                if len(parts) < 3:
+                    continue
+                for index, token in enumerate(parts):
+                    if token.isdigit() and index + 2 < len(parts) + 1:
+                        pid = int(token)
+                        if pid == mine:
+                            break
+                        names.add(f'{parts[-1]} (pid {pid})')
+                        break
+            if names:
+                return ', '.join(sorted(names))
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    if shutil.which('lsof'):
+        try:
+            done = subprocess.run(['lsof', '-F', 'cp', device],
+                                  capture_output=True, text=True, timeout=5)
+            pid, names = None, set()
+            for line in done.stdout.splitlines():
+                if line.startswith('p') and line[1:].isdigit():
+                    pid = int(line[1:])
+                elif line.startswith('c') and pid is not None and pid != mine:
+                    names.add(f'{line[1:]} (pid {pid})')
+            if names:
+                return ', '.join(sorted(names))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def capture_training_burst(device='/dev/video0', frames=None):
+    """Grab a short burst off the camera. Returns (count, folder, note)."""
+    frames = BURST_FRAMES if not frames or frames < 1 else frames
+
+    if not os.path.exists(device):
+        return 0, None, f'{device} does not exist - is the camera plugged in?'
+    if not shutil.which('ffmpeg'):
+        return 0, None, 'ffmpeg is not installed, so no frames can be grabbed'
+
+    holder = camera_holder(device)
+    if holder:
+        return 0, None, (f'{holder} has {device}, so the camera cannot be '
+                         'grabbed from while that is running - training from '
+                         'the picture folder instead is the way round it')
+
+    folder = camera_training_dir()
+    if folder is None:
+        return 0, None, 'nowhere to put the frames'
+
+    # Everything from a previous burst goes first. A burst is a set of frames
+    # of one scene in one light, and mixing tonight's with last week's is how a
+    # training folder quietly becomes a folder of two different places.
+    for stale in glob.glob(os.path.join(folder, '*.jpg')):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    got = 0
+    for number in range(1, frames + 1):
+        path = os.path.join(folder, f'camera-{stamp}-{number:02d}.jpg')
+        try:
+            done = subprocess.run(
+                ['ffmpeg', '-nostdin', '-loglevel', 'error', '-f', 'v4l2',
+                 '-i', device, '-frames:v', '1', '-q:v', '2', '-y', path],
+                capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            done = None
+        wrote = (done is not None and done.returncode == 0
+                 and os.path.exists(path) and os.path.getsize(path) > 0)
+        if wrote:
+            got += 1
+        else:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            # The first frame failing is the camera refusing; the fifth failing
+            # is a hiccup. Only the first is worth stopping for.
+            if number == 1:
+                break
+        if number < frames:
+            time.sleep(BURST_SPACING)
+
+    if not got:
+        return 0, folder, (f'ffmpeg could not grab a frame from {device} - '
+                           'another program may have taken it, or this user '
+                           'may not be in the video group')
+    return got, folder, f'grabbed {got} frames from {device}'
+
+
+def training_sources(device='/dev/video0', folder=None):
+    """Which sources the switches have selected, as [(label, folder)].
+
+    The camera one grabs its burst here, so a caller gets back only folders
+    that actually have frames in them. Returns (sources, note).
+    """
+    settings = read_settings()
+    sources, notes = [], []
+
+    if settings.get(KEY_TRAIN_CAMERA):
+        got, burst, note = capture_training_burst(device)
+        notes.append(note)
+        if got and burst:
+            sources.append(('the camera', burst))
+    if settings.get(KEY_TRAIN_PICTURES):
+        if folder and os.path.isdir(folder):
+            sources.append(('the picture folder', folder))
+        else:
+            notes.append('no picture folder to train from')
+    if not settings.get(KEY_TRAIN_CAMERA) and not settings.get(KEY_TRAIN_PICTURES):
+        notes.append('both training switches are off, so the brain is not '
+                     'being trained')
+    return sources, '; '.join(n for n in notes if n)
 
 
 def _run(args):
@@ -877,7 +1077,9 @@ class Enhancer:
                           max(float(numpy.mean(stacked.astype(numpy.float32))), 1.0))
         denoise_scale = float(mandate.get('denoise_scale') or 1.0)
         if (lifted_by > 1.6 or len(images) < 4) and denoise_scale > 0:
-            # h for luma, hColor for the colour channels.
+            # h for luma, hColor for the colour channels, both scaled by what
+            # this brain's light actually needs: a night frame lifted twelve
+            # times is mostly grain, a sunlit one has almost none.
             luma_strength = max(1, int(round((3 if len(images) >= 4 else 5)
                                              * denoise_scale)))
             chroma_strength = max(1, int(round(min(18, 6 + 4 * lifted_by)
