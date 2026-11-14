@@ -591,9 +591,19 @@ sub harvest {
 
 # Retrain on this camera if the harvest has enough. Returns a note.
 sub self_train {
+    my (%args) = @_;
     my $trainer = trainer_script();
     return undef unless length $trainer;
-    my $out = `python3 @{[ shell_quote($trainer) ]} --self-train --quiet 2>&1` || '';
+    # The brain for the preset in force, trained on the frames harvested under
+    # that preset - not one brain for the whole day. Pass all => 1 to retrain
+    # every family in turn instead.
+    my $which = $args{all}
+        ? ' --all-presets'
+        : (defined $args{preset} && length $args{preset}
+            ? ' --preset ' . shell_quote($args{preset})
+            : (do { my $p = current_preset();
+                    defined $p && length $p ? ' --preset ' . shell_quote($p) : '' }));
+    my $out = `python3 @{[ shell_quote($trainer) ]} --self-train$which --quiet 2>&1` || '';
     my @lines = grep { /\S/ } split /\n/, $out;
     return @lines ? $lines[-1] : undef;
 }
@@ -794,13 +804,74 @@ sub corpus_state {
 # says about itself, and lay that out for the window. The ImageMagick path
 # needs none of it and works without any of this being present.
 
+# ---- one brain per lighting preset ----
+#
+# The six presets collapse into five lighting regimes, each with a brain of its
+# own in ~/.webcam-models/brain_<family>/. The table has to agree with
+# BRAIN_PRESETS and BRAIN_MANDATE in train_webcam_brain.py, which is where the
+# training and the correcting read it from; this side only needs to find the
+# right folder and say what it is for.
+our %BRAIN_PRESETS = (
+    night     => [qw(night night_mono)],
+    golden_am => [qw(golden_am)],
+    day       => [qw(day)],
+    bright_sun => [qw(bright_sun)],
+    golden_pm => [qw(golden_pm)],
+);
+our @BRAIN_FAMILIES = qw(night golden_am day bright_sun golden_pm);
+
+# What each one is allowed to do, for the tile. The arithmetic that enforces
+# this lives in the Python side; these are the words for it.
+our %BRAIN_MANDATE = (
+    night      => 'brightens only, 1.0 to 12.0x, hardest lift, most denoise, sharpened',
+    golden_am  => 'sunrise, brightens only, 1.0 to 5.0x, lift eases off as the light climbs',
+    day        => 'unchanged, 1.0 to 12.0x, no dim lift and no sharpening',
+    bright_sun => 'direct sun, darkens only, 0.7 to 1.0x, and cools the colour a little',
+    golden_pm  => 'sunset, brightens only, 1.0 to 6.0x, more lift as the light drops',
+);
+
+# The family a preset belongs to, or undef. Takes a preset name or a family
+# name, so callers can pass whichever they have; with nothing passed it reads
+# the preset in force.
+sub brain_family {
+    my ($preset) = @_;
+    $preset = current_preset() unless defined $preset;
+    return undef unless defined $preset && length $preset;
+    my $name = lc $preset;
+    $name =~ s/[-\s]+/_/g;
+    return $name if exists $BRAIN_PRESETS{$name};
+    for my $family (@BRAIN_FAMILIES) {
+        for my $member (@{ $BRAIN_PRESETS{$family} }) {
+            return $family if $member eq $name;
+        }
+    }
+    return undef;
+}
+
 sub brain_dirs {
+    my ($family) = @_;
+    $family = brain_family() unless defined $family;
     my @where;
     push @where, $ENV{WEBCAM_BRAIN_DIR} if $ENV{WEBCAM_BRAIN_DIR};
-    push @where, home_dir() . '/.webcam-models/brain_g_night_model';
     my $here = ($0 =~ m{^(.*)/[^/]+$}) ? $1 : '.';
-    push @where, "$here/brain_g_night_model";
-    push @where, './brain_g_night_model';
+    if (defined $family && length $family) {
+        # This preset's own brain, and nothing else. The old all-day brain is
+        # deliberately not a fallback here: it was trained on bright and dark
+        # frames together and learnt to pull the gain below one on frames that
+        # were already bright, which is what darkened the picture in daylight.
+        # A preset with no brain of its own gets the analytic correct instead,
+        # which is a weaker correction but never the wrong one.
+        push @where, home_dir() . "/.webcam-models/brain_$family";
+        push @where, "$here/brain_$family";
+        push @where, "./brain_$family";
+    }
+    else {
+        # No preset recorded yet, so there is nothing to match against and the
+        # old folder is no worse than it ever was.
+        push @where, home_dir() . '/.webcam-models/brain_g_night_model';
+        push @where, "$here/brain_g_night_model";
+        push @where, './brain_g_night_model';
+    }
     return @where;
 }
 
@@ -827,9 +898,19 @@ sub read_json {
 
 # The brain, if there is one: (folder, meta hashref), or an empty list.
 sub brain_meta {
-    for my $dir (brain_dirs()) {
+    my ($family) = @_;
+    $family = brain_family() unless defined $family;
+    for my $dir (brain_dirs($family)) {
         next unless -f "$dir/model.keras";
         my $meta = read_json("$dir/meta.json") || {};
+        # A brain in a per-preset folder has to say it is that preset's, so a
+        # hand-moved or stale copy cannot be read as the wrong one. A brain
+        # with no family recorded is an older all-day one and is only accepted
+        # when no family is being asked for.
+        if (defined $family && length $family) {
+            my $recorded = $meta->{brain_family};
+            next if defined $recorded && length $recorded && $recorded ne $family;
+        }
         return ($dir, $meta);
     }
     return ();
@@ -894,12 +975,14 @@ sub brain_harvest_text {
 
 # (headline, text) for the tile.
 sub brain_info_text {
-    my ($dir, $meta) = brain_meta();
+    my $family = brain_family();
+    my ($dir, $meta) = brain_meta($family);
     my $helper = python_helper();
+    my $named = defined $family && length $family ? "brain $family" : 'brain G';
 
     unless (defined $dir) {
-        my $looked = join("\n", map { "    $_" } brain_dirs());
-        return ('no trained brain found - the analytic correct is doing the work',
+        my $looked = join("\n", map { "    $_" } brain_dirs($family));
+        return ("no $named yet - the analytic correct is doing the work",
                 "Looked in, in this order:\n$looked\n\n"
               . "The analytic correct still runs, so the two switches above still\n"
               . "do something - it works out one gamma for the whole frame from the\n"
@@ -908,8 +991,8 @@ sub brain_info_text {
     }
 
     my $headline = length $helper
-        ? "loaded from $dir"
-        : "found in $dir, but webcam_enhance.py is not here to run it";
+        ? "$named loaded from $dir"
+        : "$named found in $dir, but webcam_enhance.py is not here to run it";
 
     my $text = "WHAT IT DOES\n"
       . "  Predicts, for every pixel, how much to lift its brightness and\n"
@@ -934,6 +1017,12 @@ sub brain_info_text {
     };
 
     $text .= "MODEL\n";
+    $text .= $row->('this brain', defined $family && length $family
+        ? "$family - " . join(', ', @{ $BRAIN_PRESETS{$family} })
+        : 'all day (no preset recorded)');
+    $text .= $row->('what it may do', defined $family && length $family
+        ? ($BRAIN_MANDATE{$family} || '?')
+        : 'the all-day default, 1.0 to 12.0x');
     $text .= $row->('architecture', $meta->{architecture});
     $text .= $row->('features per pixel', $meta->{feature_count});
     $text .= $row->('most it may lift', defined $meta->{gain_max} ? "$meta->{gain_max}x" : undef);
