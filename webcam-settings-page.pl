@@ -1388,9 +1388,15 @@ sub build_brain_tile {
     # kept here - the same reason the terminal pane keeps $term{mw}.
     $brain_tile{mw} = $parent->toplevel;
 
+    # The heading names no particular brain. There are five and which one is
+    # live changes with the preset, so a fixed name here would be wrong four
+    # times out of five. This label is re-read on every refresh and is the one
+    # place a brain is named, because it is the brain the delete button takes.
     my $bar = $frame->Frame->pack(-fill => 'x');
-    $bar->Label(-text => 'brain G - the night vision brain',
-                -font => 'Helvetica 9 bold')->pack(-side => 'left', -padx => 4);
+    $brain_tile{active} = $bar->Label(-text => 'active brain: reading...',
+                                      -font => 'Helvetica 9 bold',
+                                      -fg => '#063')->pack(-side => 'left',
+                                                           -padx => 4);
     $brain_tile{status} = $bar->Label(-text => 'reading the brain...',
                                       -font => 'Helvetica 8', -fg => '#036');
     $brain_tile{status}->pack(-side => 'left', -padx => 4);
@@ -1654,7 +1660,7 @@ sub on_reset_brain {
     # Name the brain rather than describing it: the button deletes exactly the
     # one for the preset that is on and leaves the other four trained and
     # intact, and this line is the only place that says so while it runs.
-    my $named = 'brain G';
+    my $named = 'the active brain';
     if (enhance_module()) {
         my ($family) = eval { WebcamEnhance::active_brain() };
         $named = "brain $family" if defined $family && length $family;
@@ -1718,8 +1724,32 @@ sub poll_reset_brain {
     return 1;
 }
 
+# 'active brain: <name>' for the heading of the tile.
+#
+# Asked of the enhancement module on every refresh rather than cached, because
+# the preset can change from the scheduler or the other window while this page
+# sits open, and a stale name here would be worse than none - it is what the
+# delete button acts on.
+sub active_brain_line {
+    return 'active brain: none - WebcamEnhance.pm was not found'
+        unless enhance_module();
+    my ($family, $preset) = eval { WebcamEnhance::active_brain() };
+    return 'active brain: none yet - no preset has been applied, so the '
+         . 'analytic correct is doing the work'
+        unless defined $family && length $family;
+    my $line = "active brain: $family  (brain_$family)";
+    $line .= "  -  preset $preset"
+        if defined $preset && length $preset && $preset ne $family;
+    return $line;
+}
+
 sub refresh_brain_tile {
     return unless $brain_tile{text};
+    if ($brain_tile{active}) {
+        my $line = eval { active_brain_line() };
+        $brain_tile{active}->configure(
+            -text => defined $line ? $line : 'active brain: could not read it');
+    }
     my ($headline, $body);
     if (enhance_module()) {
         my $ok = eval { ($headline, $body) = WebcamEnhance::brain_info_text(); 1 };
