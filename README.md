@@ -533,12 +533,39 @@ of what each brain may do, in `%BRAIN_PRESETS` and `%BRAIN_MANDATE` in
 `WebcamEnhance.pm`, for the tile - the arithmetic that enforces it is all on
 the Python side.
 
-The preset in force is read from `~/.webcam-last-preset`, which `webcam-preset.pl`
-writes whenever a preset is applied, and the correction loads the brain that
-matches it. **When a preset has no brain of its own yet, the analytic
-ImageMagick correct runs instead** - the old all-day brain is deliberately not
-used as a fallback, because running it on the wrong kind of light is the
-original bug.
+### One preset, one brain, switched instantly
+
+Applying a preset deactivates every other brain and activates the one for that
+preset, on the very next frame. There is no waiting for a retrain, a restart or
+the next harvest.
+
+| preset applied | brain activated |
+| --- | --- |
+| `night` | `night` |
+| `night_mono` | `night` |
+| `golden_am` | `golden_am` |
+| `day` | `day` |
+| `bright_sun` | `bright_sun` |
+| `golden_pm` | `golden_pm` |
+
+Six presets, five brains: `night` and `night_mono` are the same light with and
+without colour and share one. Every other preset has a brain to itself.
+
+"Deactivated" means dropped, not merely unused: the other models are removed
+from the cache and TensorFlow's graph is cleared with them, so after a switch
+exactly one brain is resident and the memory the others held goes back. Nothing
+consults a brain for light it was not trained on.
+
+The switch runs off `~/.webcam-active-brain`, written at the moment the preset
+is applied and read on every frame, so a preset change takes effect
+immediately. The brain tile names the brain in use, the preset in force and
+which brains have been dropped.
+
+**A preset with no brain of its own** - `cloudy`, `defaults`, anything added
+later - gets the analytic ImageMagick correct, not the old all-day brain. That brain was
+trained across mixed light, and running it on light nobody trained for is the
+original bug. A fresh install that has not applied a preset at all may still
+read the old folder, so it is no worse off than before.
 
 ```
 # one brain per preset, each on its own harvested frames

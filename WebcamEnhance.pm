@@ -523,6 +523,12 @@ sub enhance_with_magick {
 
 our $LAST_PRESET_FILE = $ENV{WEBCAM_LAST_PRESET} || home_dir() . '/.webcam-last-preset';
 
+# Which brain is active, written at the moment a preset is applied and read by
+# the corrector on every frame. One brain is active at a time and the others
+# are not merely unused but dropped from memory - see activate_brain in
+# webcam_enhance.py. This is the file that makes a preset change instant.
+our $ACTIVE_BRAIN_FILE = $ENV{WEBCAM_ACTIVE_BRAIN} || home_dir() . '/.webcam-active-brain';
+
 # Record the preset just applied, so every frame harvested from now on is filed
 # under the preset that produced it. Written here and read by the Python side
 # too - one line, because the thing that applies a preset and the thing that
@@ -530,10 +536,46 @@ our $LAST_PRESET_FILE = $ENV{WEBCAM_LAST_PRESET} || home_dir() . '/.webcam-last-
 sub note_preset {
     my ($name) = @_;
     return 0 unless defined $name && length $name;
-    open my $fh, '>', $LAST_PRESET_FILE or return 0;
-    print {$fh} "$name\n" . time() . "\n";
-    close $fh or return 0;
-    return 1;
+    my $now = time();
+    my $ok = 1;
+    if (open my $fh, '>', $LAST_PRESET_FILE) {
+        print {$fh} "$name\n$now\n";
+        close $fh or $ok = 0;
+    }
+    else { $ok = 0; }
+
+    # And the brain that goes with it. Applying night_mono activates the night
+    # brain, applying bright_sun activates the bright_sun brain, and in both
+    # cases every other brain is dropped on the next frame.
+    my $family = brain_family($name);
+    if (open my $fh, '>', $ACTIVE_BRAIN_FILE) {
+        print {$fh} (defined $family ? $family : ''), "\n$name\n$now\n";
+        close $fh or $ok = 0;
+    }
+    else { $ok = 0; }
+    return $ok;
+}
+
+# The one brain that is active right now: (family, preset, when), with family
+# undef when no preset has been applied yet. The family is re-derived from the
+# preset rather than trusted, so moving a preset from one brain to another in
+# %BRAIN_PRESETS takes effect without this file having to be deleted.
+sub active_brain {
+    if (open my $fh, '<', $ACTIVE_BRAIN_FILE) {
+        my $family = <$fh>; my $preset = <$fh>; my $stamp = <$fh>;
+        close $fh;
+        for ($family, $preset, $stamp) { chomp $_ if defined $_; }
+        if (defined $preset && length $preset) {
+            return (brain_family($preset), $preset,
+                    (defined $stamp && $stamp =~ /^\d+$/) ? $stamp + 0 : 0);
+        }
+        if (defined $family && length $family
+            && exists $WebcamEnhance::BRAIN_PRESETS{$family}) {
+            return ($family, '', 0);
+        }
+    }
+    my $preset = current_preset();
+    return (brain_family($preset), (defined $preset ? $preset : ''), 0);
 }
 
 sub current_preset {
@@ -866,8 +908,20 @@ sub brain_dirs {
         push @where, "./brain_$family";
     }
     else {
-        # No preset recorded yet, so there is nothing to match against and the
-        # old folder is no worse than it ever was.
+        # No family. Two different situations, and only one of them may read
+        # the old all-day brain:
+        #
+        #   nothing applied yet - no preset has been recorded at all, so there
+        #       is nothing to match against and the old folder is no worse
+        #       than it ever was.
+        #   a preset with no brain of its own - cloudy, defaults, anything
+        #       added later. Here the old brain is exactly the wrong answer:
+        #       it was trained across mixed light, and running it on light
+        #       nobody trained for is the original bug. The analytic
+        #       ImageMagick correct runs instead, which is weaker but never
+        #       wrong.
+        my $recorded = current_preset();
+        return @where if defined $recorded && length $recorded;
         push @where, home_dir() . '/.webcam-models/brain_g_night_model';
         push @where, "$here/brain_g_night_model";
         push @where, './brain_g_night_model';
@@ -975,7 +1029,7 @@ sub brain_harvest_text {
 
 # (headline, text) for the tile.
 sub brain_info_text {
-    my $family = brain_family();
+    my ($family, $preset) = active_brain();
     my ($dir, $meta) = brain_meta($family);
     my $helper = python_helper();
     my $named = defined $family && length $family ? "brain $family" : 'brain G';
@@ -1020,6 +1074,11 @@ sub brain_info_text {
     $text .= $row->('this brain', defined $family && length $family
         ? "$family - " . join(', ', @{ $BRAIN_PRESETS{$family} })
         : 'all day (no preset recorded)');
+    $text .= $row->('preset in force', length($preset || '') ? $preset : '?');
+    if (defined $family && length $family) {
+        my @off = grep { $_ ne $family } @BRAIN_FAMILIES;
+        $text .= $row->('dropped from memory', join(', ', @off));
+    }
     $text .= $row->('what it may do', defined $family && length $family
         ? ($BRAIN_MANDATE{$family} || '?')
         : 'the all-day default, 1.0 to 12.0x');
