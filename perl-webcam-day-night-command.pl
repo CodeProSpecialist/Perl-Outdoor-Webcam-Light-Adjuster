@@ -895,29 +895,32 @@ my @trim_ctrls = sort keys %trim_rule;
 #
 # Saturation and hue belong to the preset outright: they decide what the
 # colours *are*, not how bright the frame is, and no amount of metering the
-# grey level is evidence about either. Gamma is the awkward one and gets a
-# rule of its own - it does change brightness, which is exactly why it is
+# grey level is evidence about either. Gamma now belongs to the preset in
+# exactly the same way. It does change brightness, which is what made it
 # tempting, and raising it is the cheapest-looking way to brighten a night
 # frame. It is also the worst: gamma lifts the noise floor along with the
 # shadows and flattens the midtones the number plate lives in, and it does it
-# to the stream the recorder is writing rather than to a copy. So gamma may be
-# left where the preset put it or pulled back DOWN from there, and never
-# raised above it. The software correction, which works on copies of the
-# stills and can be deleted and redone, is where a gamma lift belongs.
+# to the stream the recorder is writing rather than to a copy. Lowering it is
+# no better in practice - it crushes what little picture a dark frame has -
+# and a meter allowed to move it one way drifts there pass after pass. So
+# this loop does not move gamma at all, in either direction and under any
+# preset: whatever the preset wrote is what the camera runs at, and anything
+# else that moves it is put back. The software correction, which works on
+# copies of the stills and can be deleted and redone, is where a gamma lift
+# belongs.
 my @LOCKED_CTRLS = ('saturation', 'hue');
 my $GAMMA_CTRL   = 'gamma';
 
-# Night gamma is the camera's factory default and nothing else.
+# Gamma is the preset's value and nothing else.
 #
-# Gamma is left at the factory default on purpose, day and night. Moved either
-# way it turns a night frame blurry and grainy - it is a midtone curve applied
-# to a frame whose midtones are mostly sensor noise, so lifting it lifts the
-# grain and lowering it crushes what little picture is there.
-#
-# So at night gamma is pinned: the preset writes the default, and this loop
-# puts it back whichever way it has moved. The daylight rule below is the one
-# this file shipped with - by day a gamma pulled DOWN is kept, since a lower
-# gamma holds the midtones of a frame that has midtones to hold.
+# Moved either way it turns a night frame blurry and grainy - it is a midtone
+# curve applied to a frame whose midtones are mostly sensor noise, so lifting
+# it lifts the grain and lowering it crushes what little picture is there. By
+# day there is more to lose than to gain in moving it as well, so the rule is
+# the same around the clock rather than one rule per preset: the preset writes
+# gamma, and this loop puts it back whichever way it has moved. The baseline
+# is never moved to where it drifted, so one nudge cannot become the new
+# normal.
 
 my @locked_have  = ();       # which of them this camera actually has
 my %locked_base  = ();       # and the values the preset gave them
@@ -1060,8 +1063,8 @@ sub meter_learn_ranges {
         next unless $line =~ /^\s*(\w+)\s+0x[0-9a-f]+\s+\((?:int|bool|menu|intmenu)\)/i;
         my $name = $1;
         $seen{$name} = 1;
-        # gamma is not trimmed, but its range is needed: the night ceiling
-        # below is a fraction of it.
+        # gamma is never written by this loop, but its range is still
+        # read: the night ceiling below is a fraction of it.
         next unless exists $trim_rule{$name} || $name eq 'sharpness'
                  || $name eq $GAMMA_CTRL;
         my ($min) = $line =~ /min=(-?\d+)/;
@@ -1627,8 +1630,7 @@ sub meter_measure {
 # preset's focus distance.
 #
 # These are not trimmed, so the only reason to read them is to be able to tell
-# later whether they are still where the preset put them - and, for gamma,
-# what the ceiling is. Re-read whenever the baseline is re-learnt, because a
+# later whether they are still where the preset put them, gamma included. Re-read whenever the baseline is re-learnt, because a
 # preset firing is exactly when they legitimately change.
 sub meter_learn_locked {
     my ($dev) = @_;
@@ -1648,8 +1650,8 @@ sub meter_learn_locked {
     return \%locked_base;
 }
 
-# Put saturation, hue and gamma back if they have moved off the preset - and,
-# for gamma, only ever downwards.
+# Put saturation, hue and gamma back if they have moved off the preset -
+# gamma included, in either direction.
 #
 # Nothing in this loop writes them, so in normal running this finds nothing
 # and costs one read. It is here for the case that is not normal running:
@@ -1670,20 +1672,13 @@ sub meter_guard_locked {
         my $now  = $have{$name};
         next unless defined $now;
         next if $now == $want;
-        if ($name eq $GAMMA_CTRL && meter_dark_preset()) {
-            # Night gamma is pinned to the factory default. Moved either way
-            # it is put back, and the baseline is never moved to where it
-            # drifted, so one nudge cannot become the new normal for the rest
-            # of the night.
+        if ($name eq $GAMMA_CTRL) {
+            # Gamma is pinned to whatever the preset wrote, day and night.
+            # Moved either way it is put back, and the baseline is never
+            # moved to where it drifted, so one nudge cannot become the new
+            # normal.
             system("v4l2-ctl -d $dev --set-ctrl $name=$want 2>/dev/null");
-            push @fixed, "$name $now -> $want (night, factory gamma)";
-            next;
-        }
-        if ($name eq $GAMMA_CTRL && $now < $want) {
-            # By day, pulled down rather than up. Allowed, and worth keeping:
-            # a lower gamma holds the midtones together. Take it as the new
-            # ceiling rather than undoing it.
-            $locked_base{$name} = $now;
+            push @fixed, "$name $now -> $want (preset gamma)";
             next;
         }
         system("v4l2-ctl -d $dev --set-ctrl $name=$want 2>/dev/null");
@@ -2008,7 +2003,7 @@ sub meter_apply_trim {
     system("v4l2-ctl -d $dev --set-ctrl sharpness=$sharp 2>/dev/null") if defined $sharp;
 
     # Saturation, hue and gamma are not trimmed; check nothing else moved
-    # them, and pull gamma back down if it was raised.
+    # them, and put gamma back on the preset's value if it did.
     meter_guard_locked($dev);
 
     # The light just moved. Whether that costs any sharpness is a question
