@@ -1142,7 +1142,7 @@ sub brain_info_text {
         for my $pair (['dark_input', 'one dark frame'],
                       ['stack_and_clahe', 'stacked + CLAHE'],
                       ['analytic', '+ analytic correct'],
-                      ['brain', '+ brain G']) {
+                      ['brain', '+ the active brain']) {
             my ($key, $label) = @$pair;
             next unless defined $scored->{"${key}_psnr_db"};
             my $sim = $scored->{"${key}_ssim"};
