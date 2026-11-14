@@ -981,6 +981,40 @@ my $lock_note = '';          # what the locked-on target did this pass
 
 my $TRIM_MAX = 5;            # steps either side of whatever the preset set
 
+# The presets that run from golden PM, through night, to golden AM. Across
+# these the meter may brighten the picture or hold it, and may NOT darken it
+# below what the preset set.
+#
+# Why: the light is falling or already gone, and the meter's own measurement
+# is the thing that misleads it. A night frame with a security light in it
+# reads as "too bright" on the mean and on the blown-white test, and the meter
+# answers by trimming gain and brightness DOWN - which takes the car and the
+# tarmac with it to tame a lamp that was never the subject. The trims then
+# accumulate pass after pass and the live picture walks off into the dark.
+#
+# By day there is nothing wrong with trimming down: the sensor has range to
+# spare and a blown frame really is worth taming. So the floor applies to
+# these presets only; day and bright sun keep the full range either way.
+my @DARK_PRESETS = qw(golden_pm night night_mono golden_am);
+
+# Whether the preset in force is one of the falling-light ones.
+sub meter_dark_preset {
+    my $preset = eval { WebcamEnhance::current_preset() };
+    return 0 unless defined $preset && length $preset;
+    my $name = lc $preset;
+    $name =~ s/[-\s]+/_/g;
+    for my $dark (@DARK_PRESETS) {
+        return 1 if $dark eq $name;
+    }
+    return 0;
+}
+
+# How far below the preset's own values the meter may go: nothing from golden
+# PM through to golden AM, the full range by day.
+sub meter_trim_floor {
+    return meter_dark_preset() ? 0 : -$TRIM_MAX;
+}
+
 my %ctrl_range;              # name => [min, max], read from the camera
 my %meter_base;              # the preset's own values, re-learnt automatically
 my %meter_wrote;             # what this loop last sent, to spot outside changes
@@ -1898,7 +1932,8 @@ sub meter_track_adjustment {
 # more to learn it here, and if there is still nothing, say so.
 sub meter_apply_trim {
     my ($dev, $t) = @_;
-    $t = -$TRIM_MAX if $t < -$TRIM_MAX;
+    my $floor = meter_trim_floor();
+    $t = $floor if $t < $floor;
     $t =  $TRIM_MAX if $t >  $TRIM_MAX;
     $trim = $t;
     unless (%meter_base) {
@@ -2075,6 +2110,26 @@ sub meter_pass {
     shift @meter_means while @meter_means > 3;
     my $m = meter_median(@meter_means);
 
+    # A trim left over from the daylight that came before. The sun going down
+    # does not undo a cut the meter made at noon, so a preset change into the
+    # falling light can arrive with the picture already held below the preset.
+    # Lift it back to the floor before deciding anything, rather than waiting
+    # for two "too dark" passes to walk it up a step at a time.
+    if ($trim < meter_trim_floor()) {
+        my $was = $trim;
+        if (meter_apply_trim($dev, meter_trim_floor())) {
+            meter_log(sprintf('trim %+d -> %+d: the light meter does not '
+                            . 'darken the picture from golden PM through to '
+                            . 'golden AM, so the daylight trim is released',
+                              $was, $trim), always => 1);
+            $meter_hold  = $METER_SETTLE;
+            @meter_means = ();
+            return sprintf('light meter: trim %+d, the daylight trim is '
+                         . 'released - the picture is not darkened from '
+                         . 'golden PM through to golden AM', $trim);
+        }
+    }
+
     # Which way to go. The clipping checks come first: they are the too much
     # white light and too much darkness tests, and either can override a mean
     # that looks perfectly reasonable on its own.
@@ -2090,6 +2145,18 @@ sub meter_pass {
         $dir =  1; $why = 'too dark';
     }
 
+    # From golden PM through to golden AM the meter may not darken the
+    # picture. The measurement that asks it to is usually a lamp or a pair of
+    # headlights in an otherwise dark frame, and the answer - less gain, less
+    # brightness - costs the whole picture to tame one bright patch. Held at
+    # the preset rather than cut, and said plainly so the status line does not
+    # read as a correction that never happened.
+    if ($dir < 0 && $trim <= meter_trim_floor()) {
+        $dir = 0;
+        $why .= ' - holding at the preset: the light meter does not darken '
+              . 'the picture from golden PM through to golden AM';
+    }
+
     # A security light over black tarmac holds more range than the sensor can
     # take, and then both checks fail at once: brightening blows the light
     # further, darkening loses the car. Rather than run off to one end of the
@@ -2102,7 +2169,8 @@ sub meter_pass {
 
     # Two samples in a row have to agree before anything moves.
     if ($dir != 0 && $dir == $meter_dir) {
-        if (($dir > 0 && $trim >= $TRIM_MAX) || ($dir < 0 && $trim <= -$TRIM_MAX)) {
+        if (($dir > 0 && $trim >= $TRIM_MAX)
+            || ($dir < 0 && $trim <= meter_trim_floor())) {
             $why .= ' - trim at its limit, the preset itself needs changing';
         } else {
             my $sent = meter_apply_trim($dev, $trim + $dir);
